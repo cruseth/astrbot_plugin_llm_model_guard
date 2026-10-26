@@ -449,6 +449,9 @@ _POLICIES: dict[ErrorClass, _BasePolicy] = {
 }
 
 #: 用户规则动作名 → 内部动作。
+#:
+#: v0.2.0 已删除「自定义错误规则」配置项，这张表只保留给旧调用点
+#: （例如历史状态文件里的规则名），不再参与分类。
 _RULE_ACTIONS: dict[str, Action] = {
     "retry_same": Action.RETRY_SAME,
     "retry": Action.RETRY_SAME,
@@ -461,31 +464,14 @@ _RULE_ACTIONS: dict[str, Action] = {
 }
 
 
-@dataclass(frozen=True)
-class _UserRule:
-    rule_id: str
-    priority: int
-    statuses: frozenset[int]
-    exc_regex: re.Pattern[str] | None
-    msg_regex: re.Pattern[str] | None
-    action: Action
-    mark_ttl: int
-    should_mark: bool
-
-    def matches(self, sig: Signals) -> bool:
-        if self.statuses and sig.status not in self.statuses:
-            return False
-        if self.exc_regex is not None and not any(
-            self.exc_regex.search(name) for name in sig.names
-        ):
-            return False
-        if self.msg_regex is not None and not self.msg_regex.search(sig.message):
-            return False
-        return True
-
-
 class ErrorClassifier:
-    """错误分类器：内置规则 + 用户规则，输出 :class:`Classification`。"""
+    """错误分类器（v0.2.0）：只用内置规则，输出 :class:`Classification`。
+
+    v0.2.0 删除了「用户自定义错误规则」配置项（``error_rules``）。
+    **是否重试**不再由分类器决定，而是由配置项 ``retry_categories`` 决定
+    （见 :meth:`Guard._is_retryable`）：分类器只负责给出**错误类别**与
+    **该不该标记**。
+    """
 
     def __init__(
         self,
@@ -494,101 +480,26 @@ class ErrorClassifier:
         settings: Callable[[], GuardSettings] | None = None,
         logger: Any = None,
     ) -> None:
-        self._rules: tuple[_UserRule, ...] = ()
         self._settings = settings or GuardSettings
         self._logger = logger
+        # v0.2.0：用户规则已删除；保留参数形状以兼容旧调用点（直接忽略）。
         self._raw_rules: Sequence[Mapping[str, Any]] | None = None
         if user_rules:
-            self.reload_rules(user_rules)
+            self._warn("v0.2.0 已移除自定义错误规则配置，本次加载的规则被忽略")
 
-    # ---- 规则编译 ----
+    # ---- 规则统计 ----
 
     @property
     def rule_count(self) -> int:
-        return len(self._rules)
+        """内置规则条数（v0.2.0 没有用户规则）。"""
+        return len(_BUILTIN_RULES)
 
     def reload_rules(self, user_rules: Sequence[Mapping[str, Any]] | None) -> int:
-        """编译用户规则，返回成功编译条数；非法规则只记日志、不抛异常。"""
+        """兼容旧调用点：v0.2.0 不再支持用户规则，直接忽略并返回 0。"""
         self._raw_rules = user_rules
-        compiled: list[_UserRule] = []
         if user_rules:
-            for index, raw in enumerate(user_rules):
-                if not isinstance(raw, Mapping):
-                    self._warn(f"忽略第 {index + 1} 条错误规则：不是映射结构")
-                    continue
-                rule = self._compile_rule(raw, index)
-                if rule is not None:
-                    compiled.append(rule)
-        compiled.sort(key=lambda item: item.priority)
-        self._rules = tuple(compiled)
-        return len(self._rules)
-
-    def _compile_rule(self, raw: Mapping[str, Any], index: int) -> _UserRule | None:
-        rule_id = str(raw.get("id") or f"user-rule-{index + 1}").strip() or f"user-rule-{index + 1}"
-        if not bool(raw.get("enabled", True)):
-            return None
-
-        try:
-            priority = int(raw.get("priority", 10))
-        except (TypeError, ValueError):
-            self._warn(f"忽略错误规则 {rule_id}：priority 不是整数")
-            return None
-
-        statuses: set[int] = set()
-        raw_statuses = raw.get("match_status") or []
-        if isinstance(raw_statuses, (str, int)):
-            raw_statuses = [raw_statuses]
-        if isinstance(raw_statuses, Iterable) and not isinstance(raw_statuses, (str, bytes)):
-            for item in raw_statuses:
-                try:
-                    statuses.add(int(item))
-                except (TypeError, ValueError):
-                    self._warn(f"忽略错误规则 {rule_id}：match_status 含非整数 {item!r}")
-                    return None
-
-        exc_regex = self._compile_regex(raw.get("match_exc_regex"), rule_id, "match_exc_regex")
-        if exc_regex is False:
-            return None
-        msg_regex = self._compile_regex(raw.get("match_msg_regex"), rule_id, "match_msg_regex")
-        if msg_regex is False:
-            return None
-
-        action_name = str(raw.get("action", "mark_and_fallback")).strip().lower()
-        action = _RULE_ACTIONS.get(action_name)
-        if action is None:
-            self._warn(f"忽略错误规则 {rule_id}：未知 action {action_name!r}")
-            return None
-
-        try:
-            mark_ttl = max(0, int(raw.get("mark_ttl_seconds", 0)))
-        except (TypeError, ValueError):
-            mark_ttl = 0
-
-        return _UserRule(
-            rule_id=rule_id,
-            priority=priority,
-            statuses=frozenset(statuses),
-            exc_regex=exc_regex,
-            msg_regex=msg_regex,
-            action=action,
-            mark_ttl=mark_ttl,
-            should_mark=action in (Action.MARK_AND_FALLBACK, Action.FALLBACK)
-            and action_name in ("mark", "mark_and_fallback"),
-        )
-
-    def _compile_regex(
-        self, pattern: Any, rule_id: str, field_name: str
-    ) -> re.Pattern[str] | None | bool:
-        if pattern is None:
-            return None
-        text = str(pattern).strip()
-        if not text:
-            return None
-        try:
-            return re.compile(text, re.IGNORECASE)
-        except re.error as exc:
-            self._warn(f"忽略错误规则 {rule_id}：{field_name} 正则非法（{exc}）")
-            return False
+            self._warn("v0.2.0 已移除自定义错误规则配置，本次加载的规则被忽略")
+        return 0
 
     def _warn(self, message: str) -> None:
         if self._logger is not None:
@@ -604,92 +515,58 @@ class ErrorClassifier:
         chunks_emitted: int = 0,
         is_continuation: bool = False,
     ) -> Classification:
-        """把一次失败映射成处置动作；永不返回 ``None``，``unknown`` 兜底。"""
+        """把一次失败映射成处置动作；永不返回 ``None``，``unknown`` 兜底。
+
+        v0.2.0 的关键变化：
+
+        * **没有用户规则**了 —— 只有内置分类表；
+        * **没有 TTL / mark_scope / enable_* 开关**；
+        * 「能不能重试」不在这里决定（由 ``retry_categories`` 在
+          :meth:`Guard._is_retryable` 里判断）。这里只决定
+          **错误类别**、**该不该标记**、以及**要不要直接上抛**。
+        """
         settings = self._settings()
         sig = extract_signals(exc)
         error_class, builtin_rule = self._match_builtin(sig)
-        user_rule = self._match_user(sig)
-        local_fatal = self._is_local_fatal(exc, sig, error_class, user_rule)
+        local_fatal = self._is_local_fatal(exc, sig, error_class)
+
+        policy = _POLICIES.get(error_class, _POLICIES[ErrorClass.UNKNOWN])
 
         if local_fatal:
-            # 本地编程错误（TypeError/ValueError 且无状态码、无规则命中）：直接上抛，
-            # 不重试、不降级、不标记，避免把插件/框架的参数 bug 伪装成模型故障（P2-8）。
+            # 本地编程错误（TypeError/ValueError 且无状态码、无细化规则命中）：
+            # 直接上抛，不重试、不降级、不标记，避免把插件/框架的参数 bug
+            # 伪装成模型故障。
             action = Action.SURFACE
             should_mark = False
-            mark_ttl = 0
             matched_rule = LOCAL_FATAL_RULE
-        elif user_rule is not None:
-            action = user_rule.action
-            should_mark = user_rule.should_mark
-            mark_ttl = user_rule.mark_ttl
-            matched_rule = f"user:{user_rule.rule_id}"
         else:
-            policy = _POLICIES.get(error_class, _POLICIES[ErrorClass.UNKNOWN])
-            action = self._action_from_policy(policy)
+            # 重试与否交给 ``retry_categories``；这里给出「先重试再回退」的
+            # 上层动作，具体重不重试由调用方按配置决定。
+            if policy.retry:
+                action = Action.RETRY_THEN_FALLBACK
+            elif policy.mark:
+                action = Action.MARK_AND_FALLBACK
+            else:
+                action = Action.FALLBACK
             should_mark = policy.mark
-            mark_ttl = settings.ttl_for(error_class)
             matched_rule = builtin_rule
 
-        # 空输出按「连续 N 次」才标记（规划文档 §9.3 叠加规则）。
+        # 空输出：v0.2.0 不再区分「连续 N 次才标记」，直接按策略标记。
         mark_delay = 1
-        if error_class is ErrorClass.EMPTY_OUTPUT:
-            threshold = settings.mark_on_empty_output_after
-            should_mark = threshold > 0
-            mark_delay = max(1, threshold)
 
-        # 流式已产出内容：不重试、不降级、**不标记**（任务包 02 §3.4 / 裁决 P2-5）。
+        # 流式已产出内容：不重试、不降级、**不标记**。
         if stream and chunks_emitted > 0:
             action = Action.SURFACE
             should_mark = False
 
-        # 工具循环后续轮：默认不跨 provider 切换。
-        if (
-            is_continuation
-            and not settings.allow_cross_provider_switch_mid_run
-            and action is not Action.PASSTHROUGH
-        ):
-            action = Action.RETRY_SAME if action in (
-                Action.RETRY_SAME,
-                Action.RETRY_THEN_FALLBACK,
-                Action.FALLBACK,
-                Action.MARK_AND_FALLBACK,
-            ) else action
-
-        # 配置开关叠加。
-        if action is not Action.PASSTHROUGH:
-            if local_fatal:
-                # 本地编程错误不受 enable_retry/enable_fallback 影响：永远上抛。
-                action = Action.SURFACE
-                should_mark = False
-            if not settings.enable_retry and action in (
-                Action.RETRY_SAME,
-                Action.RETRY_THEN_FALLBACK,
-            ):
-                action = (
-                    Action.FALLBACK
-                    if action is Action.RETRY_THEN_FALLBACK
-                    else Action.SURFACE
-                )
-            if not settings.enable_fallback and action in (
-                Action.FALLBACK,
-                Action.RETRY_THEN_FALLBACK,
-                Action.MARK_AND_FALLBACK,
-            ):
-                action = Action.SURFACE
-            if not settings.enable_marking:
-                should_mark = False
-            if not settings.retry_empty_output and error_class is ErrorClass.EMPTY_OUTPUT:
-                if action in (Action.RETRY_SAME, Action.RETRY_THEN_FALLBACK):
-                    action = Action.FALLBACK
-
-        if not should_mark:
-            mark_ttl = 0
+        # 工具循环后续轮：v0.2.0 允许跨模型切换（回退是框架既有能力）。
+        if is_continuation and action is Action.PASSTHROUGH:
+            action = Action.SURFACE
 
         return Classification(
             error_class=error_class,
             action=action,
             should_mark=should_mark,
-            mark_ttl=mark_ttl,
             mark_delay=mark_delay,
             retry_after=sig.retry_after,
             matched_rule=matched_rule,
@@ -701,11 +578,8 @@ class ErrorClassifier:
         exc: Any,
         sig: Signals,
         error_class: ErrorClass,
-        user_rule: _UserRule | None,
     ) -> bool:
-        """``TypeError`` / ``ValueError`` 且无状态码、无规则命中 → fatal（P2-8）。"""
-        if user_rule is not None:
-            return False
+        """``TypeError`` / ``ValueError`` 且无状态码、无细化规则命中 → fatal。"""
         if sig.status is not None:
             return False
         if error_class is not ErrorClass.UNKNOWN:
@@ -720,22 +594,3 @@ class ErrorClassifier:
             except Exception:  # pragma: no cover - 规则自身异常不应影响分类
                 continue
         return ErrorClass.UNKNOWN, "builtin:unknown"
-
-    def _match_user(self, sig: Signals) -> _UserRule | None:
-        for rule in self._rules:
-            try:
-                if rule.matches(sig):
-                    return rule
-            except Exception:  # pragma: no cover
-                continue
-        return None
-
-    @staticmethod
-    def _action_from_policy(policy: _BasePolicy) -> Action:
-        if policy.retry and policy.fallback:
-            return Action.RETRY_THEN_FALLBACK
-        if policy.retry:
-            return Action.RETRY_SAME
-        if policy.fallback:
-            return Action.MARK_AND_FALLBACK if policy.mark else Action.FALLBACK
-        return Action.SURFACE

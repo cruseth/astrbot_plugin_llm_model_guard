@@ -23,15 +23,13 @@ def make_runtime(
     fallback = FakeProvider(
         "p2", stream_results=fallback_streams or [[FakeResponse("p2-chunk")]]
     )
-    merged = {
-        "routes": [{"profile_id": "default", "primary": "p1", "fallbacks": ["p2"]}],
-        **(config or {}),
-    }
     runtime = build_runtime(
         tmp_path,
-        config=merged,
+        config=dict(config or {}),
         providers=[primary, fallback],
         profiles={UMO: "default"},
+        defaults={"default": "p1"},
+        conf_fallbacks={"default": ["p2"]},
     )
     return runtime, primary, fallback
 
@@ -55,7 +53,7 @@ def test_retry_before_first_chunk(tmp_path: Path) -> None:
             [StatusError("internal server error", 500)],
             [FakeResponse("c1"), FakeResponse("c2")],
         ],
-        config={"max_retries_per_model": 1},
+        config={"max_retries": 1},
     )
     assert stream(runtime, primary) == ["c1", "c2"]
     assert primary.stream_call_count == 2
@@ -66,7 +64,7 @@ def test_fallback_before_first_chunk(tmp_path: Path) -> None:
     runtime, primary, fallback = make_runtime(
         tmp_path,
         primary_streams=[[StatusError("invalid api key", 401)]],
-        config={"max_retries_per_model": 0},
+        config={"max_retries": 0},
     )
     assert stream(runtime, primary) == ["p2-chunk"]
     assert fallback.stream_call_count == 1
@@ -77,7 +75,7 @@ def test_no_retry_after_chunk(tmp_path: Path) -> None:
     runtime, primary, fallback = make_runtime(
         tmp_path,
         primary_streams=[[FakeResponse("a"), RuntimeError("stream broke")]],
-        config={"max_retries_per_model": 3},
+        config={"max_retries": 3},
     )
     with pytest.raises(RuntimeError):
         stream(runtime, primary)
@@ -90,7 +88,7 @@ def test_no_content_mixing(tmp_path: Path) -> None:
     runtime, primary, _ = make_runtime(
         tmp_path,
         primary_streams=[[FakeResponse("a"), FakeResponse("b"), RuntimeError("boom")]],
-        config={"max_retries_per_model": 2},
+        config={"max_retries": 2},
     )
     captured: list[str] = []
 

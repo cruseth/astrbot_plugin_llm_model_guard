@@ -1,17 +1,35 @@
-"""守护运行时：候选链执行、同模型重试、降级、标记与统计。
+"""守护运行时：候选链执行、超时、同模型重试、回退、标记与统计。
 
-本模块是插件最核心的一层，由三部分构成：
+v0.2.0 的流程（任务包 12 §3，逐条对应用户手绘流程图）::
 
-1. :class:`Guard`：运行时的唯一入口，持有配置快照、路由表、分类器、包装登记表；
-2. :func:`guarded_text_chat` / :func:`guarded_text_chat_stream`：挂到 provider
-   实例上的守护方法（由 :mod:`core.registry` 调用）；
-3. 一次调用内的状态机：可重试则退避重试，不可重试则换下一个候选，全部失败才上抛。
+    请求
+     └→ 主模型
+         ├→ 超时（时间可配置）
+         └→ 报错
+             ├→ 可重试报错 → 重试（可配置次数）→ 正常输出
+             └→ 不重试报错 → 回退到次级、次次次… → 标记该模型
+         └→ （回退后的模型）报错或超时 → 同样 → 标记该模型
+    标记该模型
+     └→ 定时验证可达性（间隔可配置）
+         ├→ 失败 → 继续等待
+         └→ 连续成功 N 次（次数可配置）→ 取消标记 → 模型路由顺序调回
 
-关键纪律（规划文档 §10 / §12）：
+对应到代码：
+
+* **主模型 / 次级模型**：链路来自 :mod:`core.chain`（直接读框架顺序），
+  见 :meth:`Guard.build_selection`；
+* **超时**：:func:`_call_with_timeout`，用 ``asyncio.wait_for`` 包住调用；
+* **可重试 / 不重试的分叉**：:meth:`Guard._is_retryable`，判据是
+  ``settings.retry_categories`` 与错误分类；
+* **重试**：:meth:`Guard._run_text_chat` 内的 ``while`` 循环；
+* **回退 + 标记**：同一循环里换下一个候选前先 ``guardian.mark(...)``；
+* **定时验证 + 连续成功 N 次**：:mod:`core.guardian` 的 supervisor。
+
+关键纪律：
 
 * ``asyncio.CancelledError`` 一律原样上抛；
-* 流式一旦已经有 chunk 产出，绝不重试、绝不换候选、绝不合成内容；
-* 测活调用（``PROBE_CONTEXT``）与位置参数调用只透传，不介入；
+* 流式一旦已经有 chunk 产出，绝不重试、绝不换候选、绝不标记；
+* 验证调用（``PROBE_CONTEXT``）与位置参数调用只透传，不介入；
 * 包装层内部异常不能让对话失败：内部逻辑出错时退回原始实现并计
   ``guard_internal_errors``。
 """
@@ -27,6 +45,7 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable, Deque, Iterable, Mapping
 
+from .chain import build_chain
 from .classifier import MESSAGE_LIMIT, ErrorClassifier, summarize_error
 from .guardian import PROBE_CONTEXT, Guardian
 from .metrics import Metrics
@@ -42,18 +61,7 @@ from .models import (
     LOG_PREFIX,
     MarkSource,
     PROBE_PROMPT,
-    RouteConfig,
     log_allowed,
-)
-from .routing import (
-    WARN_ALL_CANDIDATES_MARKED,
-    WARN_ROUTE_PROVIDER_MISSING,
-    build_candidate_chain,
-    build_merged_route_table,
-    collect_profile_entries,
-    resolve_disabled_profiles,
-    resolve_profile_id,
-    select_route,
 )
 
 #: 一次对话请求的候选链上下文；按事件 task 隔离。
@@ -68,11 +76,6 @@ WRAP_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
 
 #: 候选链上下文的过期时间（秒）；框架降级二次进入的去重依赖它。
 CALL_CONTEXT_TTL_S = 180.0
-
-#: 框架配置文件列表的缓存时长（秒）。
-#: 框架的 ``get_conf_list()`` 每次都要查 SharedPreferences 数据库，是热路径上的
-#: 同步 IO；这里做短 TTL 缓存，代价是新建/删除配置文件最多延迟一个 TTL 才可见。
-PROFILE_ENTRIES_TTL_SECONDS = 30.0
 
 #: 位置参数调用无法安全重排，直接透传并计数。
 KIND_POSITIONAL = "positional_passthrough"
@@ -105,27 +108,6 @@ def _response_text(response: Any) -> str:
     return ""
 
 
-def _is_continuation(kwargs: Mapping[str, Any]) -> bool:
-    if kwargs.get("tool_calls_result"):
-        return True
-    contexts = kwargs.get("contexts") or ()
-    for item in contexts:
-        role = item.get("role") if isinstance(item, Mapping) else getattr(item, "role", None)
-        if role == "tool":
-            return True
-    return False
-
-
-def _adjust_kwargs(kwargs: Mapping[str, Any], index: int) -> dict[str, Any]:
-    """非首候选不传 ``model``（与框架自身降级行为一致，规划文档 §10.3）。"""
-    if index <= 1:
-        return dict(kwargs)
-    adjusted = dict(kwargs)
-    if "model" in adjusted:
-        adjusted["model"] = None
-    return adjusted
-
-
 def _provider_id_of(provider: Any) -> str:
     config = getattr(provider, "provider_config", None)
     if isinstance(config, Mapping):
@@ -151,47 +133,8 @@ def _status_of(exc: Any) -> int | None:
     return None
 
 
-#: 请求参数 → provider_config["modalities"] 里对应的能力名（与框架一致）。
-_MODALITY_REQUIREMENTS: tuple[tuple[str, str], ...] = (
-    ("image_urls", "image"),
-    ("audio_urls", "audio"),
-    ("func_tool", "tool_use"),
-)
-
-
-def _required_modalities(kwargs: Mapping[str, Any]) -> set[str]:
-    """本次请求实际需要哪些多模态能力（P2-3）。"""
-    needed: set[str] = set()
-    for key, modality in _MODALITY_REQUIREMENTS:
-        value = kwargs.get(key)
-        if value:
-            needed.add(modality)
-    return needed
-
-
-def _modalities_of(provider: Any) -> list[str]:
-    """provider 声明的 modalities；空/缺失表示"未配置=全支持"（与框架语义一致）。"""
-    config = getattr(provider, "provider_config", None)
-    if not isinstance(config, Mapping):
-        return []
-    modalities = config.get("modalities")
-    if isinstance(modalities, (list, tuple)):
-        return [str(item) for item in modalities]
-    return []
-
-
-def _candidate_supports(provider: Any, needed: set[str]) -> bool:
-    """候选模型是否支持本次请求所需的多模态能力。"""
-    if not needed:
-        return True
-    declared = _modalities_of(provider)
-    if not declared:
-        return True
-    return needed <= set(declared)
-
-
 def _abort_requested(abort_signal: Any) -> bool:
-    """``abort_signal`` 是否已触发（兼容 ``asyncio.Event`` / 任意带 ``is_set`` 的对象）。"""
+    """``abort_signal`` 是否已触发（兼容 ``asyncio.Event`` / 任意有 ``is_set`` 的对象）。"""
     if abort_signal is None:
         return False
     checker = getattr(abort_signal, "is_set", None)
@@ -203,6 +146,20 @@ def _abort_requested(abort_signal: Any) -> bool:
         return False
 
 
+async def _call_with_timeout(
+    factory: Callable[[], Awaitable[Any]],
+    timeout: float | None,
+) -> Any:
+    """按可选超时调用一次。
+
+    ``timeout is None``（配置为 0）表示不限制，直接 await。
+    超时抛 ``asyncio.TimeoutError``，由上层按「超时」类别处理。
+    """
+    if timeout is None or timeout <= 0:
+        return await factory()
+    return await asyncio.wait_for(factory(), timeout=timeout)
+
+
 @dataclass(frozen=True)
 class Selection:
     """hook 层的选择结果。"""
@@ -210,7 +167,6 @@ class Selection:
     provider_id: str | None
     plan: ChainPlan
     profile_id: str | None = None
-    route: RouteConfig | None = None
     manual_id: str = ""
 
     @property
@@ -247,17 +203,7 @@ class Guard:
         self._stopping = False
         self._settings: GuardSettings | None = None
         self._settings_fingerprint = ""
-        self._route_table: dict[str, RouteConfig] = {}
-        self._route_warnings: list[str] = []
-        self._route_fingerprint = ""
-        self._profile_entries: list[dict[str, str]] = []
-        self._profile_entries_fingerprint = ""
-        self._profile_entries_fetched_at = -1e18
-        self._disabled_profile_ids: frozenset[str] = frozenset()
-        self._disabled_fingerprint = ""
         self._retry_budget: dict[str, Deque[float]] = {}
-        self._classifier_installed: int = 0
-        self._rules_signature: str = ""
 
         from .registry import WrapRegistry
 
@@ -266,10 +212,9 @@ class Guard:
             settings=lambda: self.settings,
             logger=logger,
         )
-        self._sync_classifier_rules()
 
     # ------------------------------------------------------------------
-    # 配置与路由表（带指纹缓存）
+    # 配置
     # ------------------------------------------------------------------
 
     @property
@@ -284,102 +229,6 @@ class Guard:
             self._settings = snapshot
             self._settings_fingerprint = fingerprint
         return self._settings
-
-    @property
-    def disabled(self) -> bool:
-        return self._stopping or not self.settings.enable
-
-    @property
-    def profile_entries(self) -> list[dict[str, str]]:
-        """框架里的配置文件列表（id / name / path），带 TTL 缓存。
-
-        框架的 ``get_conf_list()`` 每次都会查一次 SharedPreferences 数据库，
-        属于热路径上的同步 IO，因此这里做 **TTL 缓存**：默认
-        :data:`PROFILE_ENTRIES_TTL_SECONDS` 秒内复用上一次结果。
-
-        缓存过期后重新拉取：框架新建/删除配置文件最多延迟一个 TTL 才会被看到
-        （新建后可用 ``/llmguard reload`` 立即刷新）。
-        """
-        now = self._monotonic()
-        if (
-            self._profile_entries
-            and (now - self._profile_entries_fetched_at) < PROFILE_ENTRIES_TTL_SECONDS
-        ):
-            return self._profile_entries
-        entries = collect_profile_entries(self.acm)
-        self._profile_entries = entries
-        self._profile_entries_fetched_at = now
-        self._profile_entries_fingerprint = "|".join(
-            sorted(f"{item['id']}::{item['name']}" for item in entries)
-        )
-        return self._profile_entries
-
-    def refresh_profile_entries(self) -> list[dict[str, str]]:
-        """强制重新拉取框架配置文件列表（忽略 TTL 缓存）。
-
-        用于「用户在框架里刚新建了 abconf，想立刻在插件配置页看到它」的场景。
-        """
-        self._profile_entries_fetched_at = -1e18
-        return self.profile_entries
-
-    @property
-    def route_table(self) -> dict[str, RouteConfig]:
-        settings = self.settings
-        entries = self.profile_entries
-        # 指纹同时包含配置与配置文件列表：框架里新增/重命名 abconf 后，
-        # 按名称配置的路由才能被重新解析。
-        fingerprint = f"{settings.fingerprint()}\x1e{self._profile_entries_fingerprint}"
-        if fingerprint != self._route_fingerprint:
-            warnings: list[str] = []
-            table, _resolved = build_merged_route_table(
-                settings.routes,
-                settings.profiles,
-                entries=entries,
-                warnings=warnings,
-            )
-            self._route_table = table
-            self._route_warnings = warnings
-            self._route_fingerprint = fingerprint
-            self._sync_classifier_rules()
-            for code in warnings:
-                self._warn(f"路由配置告警：{code}")
-        return self._route_table
-
-    @property
-    def disabled_profile_ids(self) -> frozenset[str]:
-        """``disabled_profiles`` 解析后的真实 id 集合（支持填名称）。"""
-        settings = self.settings
-        entries = self.profile_entries
-        fingerprint = f"{settings.fingerprint()}\x1e{self._profile_entries_fingerprint}"
-        if fingerprint != self._disabled_fingerprint:
-            warnings: list[str] = []
-            resolved = resolve_disabled_profiles(
-                settings.disabled_profiles,
-                entries=entries,
-                warnings=warnings,
-            )
-            self._disabled_profile_ids = frozenset(resolved)
-            self._disabled_fingerprint = fingerprint
-            for code in warnings:
-                self._warn(f"不接管列表告警：{code}")
-        return self._disabled_profile_ids
-
-    def _sync_classifier_rules(self) -> None:
-        """把配置里的自定义规则同步到分类器；规则内容变化才重新编译。"""
-        rules = [dict(rule) for rule in self.settings.error_rules]
-        signature = json.dumps(
-            rules,
-            sort_keys=True,
-            ensure_ascii=False,
-            default=str,
-        )
-        if signature == self._rules_signature:
-            return
-        count = self.classifier.reload_rules(rules)
-        self._rules_signature = signature
-        self._classifier_installed = len(rules)
-        if rules:
-            self._debug(f"已编译 {count}/{len(rules)} 条自定义错误规则")
 
     # ------------------------------------------------------------------
     # 框架对象访问（全部惰性，避免 __init__ 时机拿不到 provider）
@@ -414,87 +263,36 @@ class Guard:
                     return provider
         return None
 
-    def native_provider_id(self, umo: str | None) -> str | None:
-        getter = getattr(self.context, "get_using_provider", None)
-        if not callable(getter) or not umo:
-            return None
-        try:
-            provider = getter(umo=umo)
-        except TypeError:
-            try:
-                provider = getter(umo)
-            except Exception:
-                return None
-        except Exception:
-            return None
-        if provider is None:
-            return None
-        return _provider_id_of(provider) or None
-
-    def framework_fallback_ids(self, umo: str | None) -> list[str]:
-        acm = self.acm
-        get_conf = getattr(acm, "get_conf", None)
-        if not callable(get_conf) or not umo:
-            return []
-        try:
-            conf = get_conf(umo)
-        except Exception:
-            return []
-        settings_block = conf.get("provider_settings") if isinstance(conf, Mapping) else None
-        if not isinstance(settings_block, Mapping):
-            return []
-        fallbacks = settings_block.get("fallback_chat_models") or []
-        if not isinstance(fallbacks, Iterable) or isinstance(fallbacks, (str, bytes)):
-            return []
-        return [str(item) for item in fallbacks if isinstance(item, str) and item.strip()]
-
     # ------------------------------------------------------------------
     # 选路（hook 层）
     # ------------------------------------------------------------------
 
     def build_selection(self, *, umo: str | None, manual_id: str = "") -> Selection:
-        """解析配置文件 → 路由 → 候选链；``enable=false`` 时零介入。"""
+        """按框架的模型顺序构建候选链；``enable=false`` 时零介入。"""
         settings = self.settings
         if self.disabled:
             return Selection(None, ChainPlan())
-        profile_id = resolve_profile_id(umo, self.acm)
-        route: RouteConfig | None = None
-        if settings.enable_routing:
-            route = select_route(
-                profile_id=profile_id,
-                table=self.route_table,
-                disabled_profiles=self.disabled_profile_ids,
-            )
-        native_id = self.native_provider_id(umo)
-        marks = self.guardian.marks_for(profile_id)
-        known_ids = self.provider_ids() or None
-        warnings: list[str] = []
-        # 手动选择（webchat）与会话级切换在框架里同源：都是 event 的
-        # ``selected_provider`` extra，因此两项开关任一开启即尊重该选择。
-        respect_manual = (
-            settings.respect_manual_selection or settings.respect_session_selection
-        )
-        plan = build_candidate_chain(
-            route=route,
-            requested_id=manual_id,
-            native_id=native_id,
-            framework_fallback_ids=self.framework_fallback_ids(umo),
-            fallback_pool=settings.fallback_pool,
-            marks=marks,
-            union_framework_fallbacks=settings.union_framework_fallbacks,
-            respect_manual_selection=respect_manual,
-            known_ids=known_ids,
-            warnings=warnings,
-        )
+        plan = self.build_plan(umo=umo, manual_id=manual_id)
         self._report_plan_warnings(plan)
-        selection = Selection(
+        return Selection(
             provider_id=plan.first,
             plan=plan,
-            profile_id=profile_id,
-            route=route,
+            profile_id=None,
             manual_id=manual_id,
         )
-        return selection
+
+    def build_plan(self, *, umo: str | None, manual_id: str = "") -> ChainPlan:
+        """构建候选链：手动选择 + 框架当前 + 该 abconf 的回退列表。"""
+        settings = self.settings
+        known = self.provider_ids() or None
+        marked = set(self.guardian.marked_ids())
+        return build_chain(
+            provider_manager=self.provider_manager,
+            umo=umo,
+            manual_id=manual_id,
+            known_ids=known,
+            marked_ids=marked,
+        )
 
     def _report_plan_warnings(self, plan: ChainPlan) -> None:
         if plan.degraded_use is not None:
@@ -505,8 +303,8 @@ class Guard:
             )
         for provider_id in plan.missing:
             self._warn_once(
-                f"route_provider_missing:{provider_id}",
-                f"路由引用的模型 {provider_id} 不存在，已从候选链剔除",
+                f"chain_provider_missing:{provider_id}",
+                f"链路里的模型 {provider_id} 不存在，已从候选链剔除",
             )
 
     def push_call_context(
@@ -522,7 +320,6 @@ class Guard:
             umo=umo,
             profile_id=selection.profile_id,
             requested=requested or (selection.plan.first or ""),
-            route=selection.route,
             created_at=self._clock(),
         )
         CALL_CONTEXT.set(context)
@@ -684,7 +481,7 @@ class Guard:
         return WRAP_DEPTH.get() >= MAX_WRAP_DEPTH
 
     # ------------------------------------------------------------------
-    # 上下文解析（D2：session_id → contextvar → 未纳管）
+    # 上下文解析
     # ------------------------------------------------------------------
 
     def resolve_call_context(
@@ -700,52 +497,35 @@ class Guard:
         if not settings.enable:
             return existing
 
-        if not settings.enable_routing:
-            # 不接管选择，但仍对「框架选中的这个模型」做重试/标记/统计。
-            if not provider_id:
-                return existing
-            return CallContext(
-                plan=ChainPlan(candidates=(provider_id,), source="native"),
-                umo=str(session_id) if session_id else None,
-                profile_id=resolve_profile_id(str(session_id), self.acm) if session_id else None,
-                requested=provider_id,
-                created_at=self._clock(),
-            )
-
         if not session_id:
             return existing
 
-        profile_id = resolve_profile_id(str(session_id), self.acm)
-        if profile_id is None:
-            return None
-        route = select_route(
-            profile_id=profile_id,
-            table=self.route_table,
-            disabled_profiles=self.disabled_profile_ids,
-        )
-        if route is None:
-            return None
-        marks = self.guardian.marks_for(profile_id)
-        plan = build_candidate_chain(
-            route=route,
-            framework_fallback_ids=self.framework_fallback_ids(str(session_id)),
-            fallback_pool=settings.fallback_pool,
-            marks=marks,
-            union_framework_fallbacks=settings.union_framework_fallbacks,
-            respect_manual_selection=False,
-            known_ids=self.provider_ids() or None,
-        )
+        # 没有会话标识就无法确定「该配置文件」，此时退化为「只管框架选中的这个模型」。
+        plan = self.build_plan(umo=str(session_id))
         if not plan.candidates:
             return None
         self._report_plan_warnings(plan)
         return CallContext(
             plan=plan,
             umo=str(session_id),
-            profile_id=profile_id,
+            profile_id=None,
             requested=plan.first or "",
-            route=route,
             created_at=self._clock(),
         )
+
+    # ------------------------------------------------------------------
+    # 重试 / 回退判据
+    # ------------------------------------------------------------------
+
+    def _is_retryable(self, classification: Classification, settings: GuardSettings) -> bool:
+        """该错误是否属于「可重试」。
+
+        判据是**错误类别是否在 ``retry_categories`` 里**（流程图的分叉点）。
+        本地编程错误（``Action.SURFACE`` 且 ``should_mark=False``）永不重试。
+        """
+        if classification.action is Action.SURFACE and not classification.should_mark:
+            return False
+        return settings.is_retryable(classification.error_class)
 
     # ------------------------------------------------------------------
     # 非流式执行
@@ -755,15 +535,11 @@ class Guard:
         self, provider: Any, context: CallContext, kwargs: dict[str, Any]
     ) -> Any:
         settings = self.settings
-        is_continuation = _is_continuation(kwargs)
-        abort_signal = kwargs.get("abort_signal")
-        needed_modalities = _required_modalities(kwargs)
-        started_all = self._monotonic()
+        timeout = settings.request_timeout()
         last_excause: BaseException | None = None
         last_response: Any = None
         last_classification: Classification | None = None
         tried = 0
-        allow_fallback = True
 
         for index, provider_id in enumerate(context.plan.candidates, start=1):
             if self._skip_attempted(provider_id, context):
@@ -772,29 +548,28 @@ class Guard:
                 continue
             target = self._resolve_candidate(provider, provider_id)
             if target is None:
-                self.metrics.note_counter("route_provider_missing")
+                self.metrics.note_counter("chain_provider_missing")
                 self._warn_once(
-                    f"route_provider_missing:{provider_id}",
+                    f"chain_provider_missing:{provider_id}",
                     f"候选 {provider_id} 不存在，跳过",
                 )
                 continue
-            if index > 1 and not _candidate_supports(target, needed_modalities):
-                self._skip_modality_incompatible(provider_id, target, needed_modalities)
-                continue
 
-            per_model_retries, _, _ = settings.route_execution(context.route)
             attempt = 0
             while True:
                 attempt += 1
                 tried += 1
                 context.attempted.add(provider_id)
-                call_kwargs = _adjust_kwargs(kwargs, index)
+                call_kwargs = self._adjust_kwargs(kwargs, index)
                 t0 = self._monotonic()
                 self.guardian.inc_active(provider_id)
                 error: BaseException | None = None
                 response: Any = None
                 try:
-                    response = await self._call_original(target, "text_chat", **call_kwargs)
+                    response = await _call_with_timeout(
+                        lambda: self._call_original(target, "text_chat", **call_kwargs),
+                        timeout,
+                    )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - 分类后决定是否上抛
@@ -816,12 +591,7 @@ class Guard:
                     return response
 
                 failure = error if error is not None else response
-                classification = self._safe_classify(
-                    failure,
-                    stream=False,
-                    chunks_emitted=0,
-                    is_continuation=is_continuation,
-                )
+                classification = self._safe_classify(failure, stream=False)
                 self._record_failure(
                     used=provider_id,
                     requested=context.requested,
@@ -831,30 +601,33 @@ class Guard:
                     total_ms=total_ms,
                     attempt_index=attempt,
                 )
-                await self._maybe_mark(provider_id, classification, context)
 
                 last_excause = error
                 last_response = response if error is None else None
                 last_classification = classification
-                allow_fallback = classification.allows_fallback
 
-                if error is None and not allow_fallback:
-                    # 不重试也不降级：把 err 响应原样交给框架。
+                # 本地编程错误：直接上抛，不重试、不标记、不切换候选。
+                if classification.action is Action.SURFACE and not classification.should_mark:
+                    self._error(
+                        f"{provider_id} 出现本地错误（{classification.error_class}），直接上抛"
+                    )
+                    if error is not None:
+                        raise error
                     return response
 
+                retryable = self._is_retryable(classification, settings)
                 retry_allowed = (
-                    classification.allows_retry
-                    and attempt <= per_model_retries
-                    and self._within_total_budget(started_all, settings)
-                    and self._consume_retry_budget(context.umo, settings)
+                    retryable
+                    and attempt <= settings.max_retries
+                    and self._within_total_budget(settings)
                 )
                 if retry_allowed:
-                    delay = self.backoff_delay(attempt, classification.retry_after, settings)
+                    delay = settings.retry_delay(attempt)
                     self._info(
                         f"{provider_id} 第 {attempt} 次失败（{classification.error_class}），"
                         f"{delay:.2f}s 后重试同一模型"
                     )
-                    await self._sleep(delay, abort_signal=abort_signal)
+                    await self._sleep(delay, abort_signal=kwargs.get("abort_signal"))
                     if self._stopping:
                         break
                     continue
@@ -862,8 +635,10 @@ class Guard:
 
             if self._stopping:
                 break
-            if not allow_fallback:
-                break
+
+            # 放弃该候选：标记它，然后回退到下一个（流程图：「回退 → 标记该模型」）。
+            if last_classification is not None and last_classification.should_mark:
+                await self._maybe_mark(provider_id, last_classification, context)
             if index < len(context.plan.candidates):
                 self._info(f"{provider_id} 放弃本次候选，改用下一个候选模型")
 
@@ -879,7 +654,16 @@ class Guard:
         # 一个候选都没能尝试：回到框架原生实现，保持对话可用。
         return await self._call_original(provider, "text_chat", **kwargs)
 
-    # ---- 候选筛选辅助（P2-1 / P2-3）----
+    def _adjust_kwargs(self, kwargs: Mapping[str, Any], index: int) -> dict[str, Any]:
+        """非首候选不传 ``model``（与框架自身降级行为一致）。"""
+        if index <= 1:
+            return dict(kwargs)
+        adjusted = dict(kwargs)
+        if "model" in adjusted:
+            adjusted["model"] = None
+        return adjusted
+
+    # ---- 候选筛选辅助 ----
 
     def _skip_attempted(self, provider_id: str, context: CallContext) -> bool:
         """同一 ``CallContext`` 里已尝试过的候选一律跳过（含框架降级二次进入）。"""
@@ -890,10 +674,10 @@ class Guard:
         return True
 
     def _skip_marked(self, provider_id: str, context: CallContext) -> bool:
-        """被标记且不是"全被标记兜底"的那个候选时跳过（P2-1 第二道保险）。"""
+        """被标记且不是"全被标记兜底"的那个候选时跳过。"""
         if provider_id == context.plan.degraded_use:
             return False
-        if not self.guardian.is_marked(provider_id, profile_id=context.profile_id):
+        if not self.guardian.is_marked(provider_id):
             return False
         self.metrics.note_counter("marked_candidate_skipped")
         self._warn_once(
@@ -907,23 +691,13 @@ class Guard:
             return provider
         return self.provider_for(provider_id)
 
-    def _skip_modality_incompatible(
-        self, provider_id: str, target: Any, needed: set[str]
-    ) -> None:
-        self.metrics.note_counter("candidate_modality_incompatible")
-        self._warn_once(
-            f"modality:{provider_id}",
-            f"跳过候选 {provider_id}：本次请求需要 {sorted(needed)}，"
-            f"该模型 modalities={_modalities_of(target)}（空表示支持全部）",
-        )
-
     def _annotate_failure(
         self,
-        exc: BaseException,
+        exc: Any,
         classification: Classification | None,
         context: CallContext,
     ) -> None:
-        """全链失败时把最后一次分类摘要附到异常上，方便用户/日志定位（P3-9）。"""
+        """全链失败时把最后一次分类摘要附到异常上，方便用户/日志定位。"""
         message = self._chain_failed_message(0, classification, context)
         adder = getattr(exc, "add_note", None)
         if callable(adder):
@@ -962,10 +736,7 @@ class Guard:
         self, provider: Any, context: CallContext, kwargs: dict[str, Any]
     ) -> AsyncIterator[Any]:
         settings = self.settings
-        is_continuation = _is_continuation(kwargs)
-        abort_signal = kwargs.get("abort_signal")
-        needed_modalities = _required_modalities(kwargs)
-        started_all = self._monotonic()
+        timeout = settings.request_timeout()
         last_excause: BaseException | None = None
         last_classification: Classification | None = None
         tried = 0
@@ -977,19 +748,15 @@ class Guard:
                 continue
             target = self._resolve_candidate(provider, provider_id)
             if target is None:
-                self.metrics.note_counter("route_provider_missing")
-                continue
-            if index > 1 and not _candidate_supports(target, needed_modalities):
-                self._skip_modality_incompatible(provider_id, target, needed_modalities)
+                self.metrics.note_counter("chain_provider_missing")
                 continue
 
-            per_model_retries, _, _ = settings.route_execution(context.route)
             attempt = 0
             while True:
                 attempt += 1
                 tried += 1
                 context.attempted.add(provider_id)
-                call_kwargs = _adjust_kwargs(kwargs, index)
+                call_kwargs = self._adjust_kwargs(kwargs, index)
                 original = self.original(target, "text_chat_stream")
                 if original is None:
                     break
@@ -999,14 +766,29 @@ class Guard:
                 self.guardian.inc_active(provider_id)
                 error: BaseException | None = None
                 try:
-                    async for chunk in original(**call_kwargs):
+                    # 流式只对**首个 chunk** 施加超时（任务包 12 §3.2）：
+                    # 首块之后不再施加，避免长回答被误杀。
+                    stream = original(**call_kwargs)
+                    iterator = stream.__aiter__()
+                    while True:
+                        try:
+                            if emitted == 0:
+                                # 首块：受超时约束。
+                                chunk = await _call_with_timeout(
+                                    lambda: iterator.__anext__(), timeout
+                                )
+                            else:
+                                # 后续块：不施加超时。
+                                chunk = await iterator.__anext__()
+                        except StopAsyncIteration:
+                            break
                         if first_chunk_ms is None:
                             first_chunk_ms = int((self._monotonic() - t0) * 1000)
                         emitted += 1
                         yield chunk
                 except asyncio.CancelledError:
                     raise
-                except Exception as exc:  # noqa: BLE001 - 分类后决定是否上抛
+                except Exception as exc:  # noqa: BLE001
                     error = exc
                 finally:
                     self.guardian.dec_active(provider_id)
@@ -1021,16 +803,13 @@ class Guard:
                         ok=True,
                         total_ms=total_ms,
                         first_chunk_ms=first_chunk_ms,
-                        stream=True,
                         attempt_index=attempt,
+                        stream=True,
                     )
                     return
 
                 classification = self._safe_classify(
-                    error,
-                    stream=True,
-                    chunks_emitted=emitted,
-                    is_continuation=is_continuation,
+                    error, stream=True, chunks_emitted=emitted
                 )
                 last_classification = classification
                 self._record_failure(
@@ -1040,36 +819,44 @@ class Guard:
                     classification=classification,
                     failure=error,
                     total_ms=total_ms,
-                    first_chunk_ms=first_chunk_ms,
-                    stream=True,
                     attempt_index=attempt,
+                    stream=True,
                 )
                 if emitted > 0:
-                    # 已产出内容：不重试、不换候选、**不标记**，只记统计后原样上抛
-                    # （任务包 02 §3.4 / 裁决 P2-5）。
+                    # 已产出内容：不重试、不换候选、**不标记**，只记统计后原样上抛。
                     self._debug(f"{provider_id} 流式中断但不写标记（已产出 {emitted} 块）")
                     raise error
 
-                await self._maybe_mark(provider_id, classification, context)
                 last_excause = error
 
+                if classification.action is Action.SURFACE and not classification.should_mark:
+                    self._error(
+                        f"{provider_id} 出现本地错误（{classification.error_class}），直接上抛"
+                    )
+                    raise error
+
+                retryable = self._is_retryable(classification, settings)
                 retry_allowed = (
-                    classification.allows_retry
-                    and attempt <= per_model_retries
-                    and self._within_total_budget(started_all, settings)
-                    and self._consume_retry_budget(context.umo, settings)
+                    retryable
+                    and attempt <= settings.max_retries
+                    and self._within_total_budget(settings)
                 )
                 if retry_allowed:
-                    delay = self.backoff_delay(attempt, classification.retry_after, settings)
+                    delay = settings.retry_delay(attempt)
                     self._info(
-                        f"{provider_id} 流式第 {attempt} 次失败（{classification.error_class}），"
+                        f"{provider_id} 第 {attempt} 次失败（{classification.error_class}），"
                         f"{delay:.2f}s 后重试同一模型"
                     )
-                    await self._sleep(delay, abort_signal=abort_signal)
+                    await self._sleep(delay, abort_signal=kwargs.get("abort_signal"))
                     if self._stopping:
                         break
                     continue
                 break
+
+            if self._stopping:
+                break
+            if last_classification is not None and last_classification.should_mark:
+                await self._maybe_mark(provider_id, last_classification, context)
 
         if last_excause is not None:
             self._annotate_failure(last_excause, last_classification, context)
@@ -1082,16 +869,13 @@ class Guard:
                 yield chunk
 
     # ------------------------------------------------------------------
-    # 未纳管 / 测活透传
+    # 未纳管 / 验证透传
     # ------------------------------------------------------------------
 
     async def _unmanaged_call(
         self, provider: Any, name: str, kwargs: dict[str, Any]
     ) -> Any:
-        settings = self.settings
         provider_id = _provider_id_of(provider)
-        if not settings.enable_monitoring or not settings.unmanaged_monitoring:
-            return await self._call_original(provider, name, **kwargs)
         t0 = self._monotonic()
         self.guardian.inc_active(provider_id)
         error: BaseException | None = None
@@ -1107,7 +891,7 @@ class Guard:
         total_ms = int((self._monotonic() - t0) * 1000)
         classification = None
         if error is not None:
-            classification = self._safe_classify(error, stream=False, chunks_emitted=0)
+            classification = self._safe_classify(error, stream=False)
         self._record_attempt(
             used=provider_id or "unknown",
             requested="",
@@ -1131,7 +915,7 @@ class Guard:
             yield chunk
 
     async def _probe_passthrough(self, provider: Any, kwargs: dict[str, Any]) -> Any:
-        """测活透传：只统计，不重试、不降级、不标记（D7 防递归）。"""
+        """验证透传：只统计，不重试/不降级/不标记（防递归）。"""
         provider_id = _provider_id_of(provider) or "probe"
         t0 = self._monotonic()
         try:
@@ -1146,9 +930,7 @@ class Guard:
         self.metrics.record_probe(provider_id, ok=True, latency_ms=latency)
         return response
 
-    async def _probe_passthrough_stream(
-        self, provider: Any, kwargs: dict[str, Any]
-    ) -> AsyncIterator[Any]:
+    async def _probe_passthrough_stream(self, provider: Any, kwargs: dict[str, Any]) -> Any:
         original = self.original(provider, "text_chat_stream")
         if original is None:
             raise AttributeError("provider 缺少原始方法 text_chat_stream")
@@ -1168,11 +950,9 @@ class Guard:
             return await self.guardian.mark(
                 provider_id,
                 reason=str(classification.error_class),
-                ttl=classification.mark_ttl,
+                ttl=0,
                 source=MarkSource.AUTO,
                 detail=classification.detail,
-                delay=classification.mark_delay,
-                profile_hint=context.profile_id or "",
             )
         except asyncio.CancelledError:
             raise
@@ -1202,8 +982,7 @@ class Guard:
                 error_class=ErrorClass.UNKNOWN,
                 action=Action.SURFACE,
                 should_mark=False,
-                mark_ttl=0,
-                matched_rule="guard:internal-error",
+                    matched_rule="guard:internal-error",
             )
 
     def _record_attempt(
@@ -1220,13 +999,10 @@ class Guard:
         classification: Classification | None = None,
         failure: Any = None,
     ) -> None:
-        if not self.settings.enable_monitoring:
-            return
         error_message = classification.detail if classification else None
         if failure is not None:
             raw = failure if isinstance(failure, BaseException) else _response_text(failure)
             if raw:
-                # 最近事件里的错误摘要允许到 500 字符（落盘字段白名单仍受约束）。
                 error_message = summarize_error(str(raw), limit=MESSAGE_LIMIT) or error_message
         record = AttemptRecord(
             ts=self._clock(),
@@ -1273,43 +1049,12 @@ class Guard:
             failure=failure,
         )
 
-    def _within_total_budget(self, started_all: float, settings: GuardSettings) -> bool:
-        if settings.retry_total_timeout <= 0:
-            return True
-        return (self._monotonic() - started_all) < settings.retry_total_timeout
-
-    def _consume_retry_budget(self, umo: str | None, settings: GuardSettings) -> bool:
-        limit = settings.retry_budget_per_umo_per_minute
-        if limit <= 0:
-            return True
-        key = umo or ""
-        now = self._clock()
-        bucket = self._retry_budget.setdefault(key, deque())
-        while bucket and now - bucket[0] > 60.0:
-            bucket.popleft()
-        if len(bucket) >= limit:
-            self._warn_once(
-                f"retry_budget:{key}",
-                f"会话 {key or '(空)'} 每分钟重试次数已达上限 {limit}，本次不再重试",
-            )
-            return False
-        bucket.append(now)
-        return True
-
-    def backoff_delay(
-        self, attempt: int, retry_after: float | None, settings: GuardSettings
-    ) -> float:
-        if retry_after is not None and retry_after >= 0:
-            return min(max(0.0, retry_after), settings.retry_backoff_max or retry_after)
-        raw = settings.retry_backoff_base * (settings.retry_backoff_factor ** max(0, attempt - 1))
-        raw = min(raw, settings.retry_backoff_max)
-        ratio = settings.retry_jitter_ratio
-        if ratio > 0:
-            raw *= 1.0 + random.uniform(-ratio, ratio)
-        return max(0.0, raw)
+    def _within_total_budget(self, settings: GuardSettings) -> bool:
+        """退避等待是否仍在允许的范围内（用 ``retry_backoff_seconds`` 粗略约束）。"""
+        return settings.retry_backoff_seconds >= 0.0
 
     async def _sleep(self, seconds: float, *, abort_signal: Any = None) -> None:
-        """分段退避等待：每 ≤0.2s 检查一次插件停止与用户中断（P2-2）。
+        """分段退避等待：每 ≤0.2s 检查一次插件停止与用户中断。
 
         ``abort_signal`` 是框架的 ``asyncio.Event``（"停止生成"时 set）；一旦触发
         立即抛 ``asyncio.CancelledError`` 向上传播，不再干等满一次退避。
@@ -1332,16 +1077,16 @@ class Guard:
     # 生命周期
     # ------------------------------------------------------------------
 
+    @property
+    def disabled(self) -> bool:
+        return self._stopping or not self.settings.enable
+
     def mark_stopping(self) -> None:
         self._stopping = True
 
     def invalidate_caches(self) -> None:
         """让配置派生缓存失效（配置热重载、命令 ``/llmguard reload`` 用）。"""
         self._settings_fingerprint = ""
-        self._route_fingerprint = ""
-        self._disabled_fingerprint = ""
-        # 配置文件列表也立刻重取，方便刚在 WebUI 新建的 abconf 马上可用。
-        self._profile_entries_fetched_at = -1e18
 
     @property
     def state_path(self) -> str:
@@ -1372,15 +1117,15 @@ class Guard:
         self._warn(message)
 
     def _info(self, message: str) -> None:
-        if self.logger is not None and log_allowed(self.settings.log_level, "info"):
+        if self.logger is not None and log_allowed("", "info"):
             self.logger.info(f"{LOG_PREFIX} {message}")
 
     def _warn(self, message: str) -> None:
-        if self.logger is not None and log_allowed(self.settings.log_level, "warning"):
+        if self.logger is not None and log_allowed("", "warning"):
             self.logger.warning(f"{LOG_PREFIX} {message}")
 
     def _debug(self, message: str) -> None:
-        if self.logger is not None and log_allowed(self.settings.log_level, "debug"):
+        if self.logger is not None and log_allowed("", "debug"):
             self.logger.debug(f"{LOG_PREFIX} {message}")
 
     def _error(self, message: str) -> None:

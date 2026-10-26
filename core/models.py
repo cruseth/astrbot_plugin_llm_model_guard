@@ -1,10 +1,16 @@
 """纯数据模型：核心枚举、配置快照与运行时视图。
 
-设计约束（见规划文档 §4.2）：
+v0.2.0 的设计要点（任务包 12）
+----------------------------
 
-* 本模块只依赖 Python 标准库，**不导入 AstrBot**，也不做任何 I/O；
-* 所有 dataclass 都是不可变的（``frozen=True``），便于在热路径安全共享；
-* 其余 ``core`` 模块都只依赖本模块，依赖方向严格单向。
+配置被压缩到 **8 个全局键**，其中**没有任何 provider id / 配置文件 id**：
+
+* 插件不再要求用户描述每个配置文件的模型顺序 —— 链路直接读框架
+  （``core/chain.py``）；
+* 因此也不需要"下拉选择配置文件"：那不是没实现，而是不再需要。
+
+本模块只依赖 Python 标准库，**不导入 AstrBot**，也不做任何 I/O；
+其余 ``core`` 模块都只依赖本模块，依赖方向严格单向。
 """
 
 from __future__ import annotations
@@ -20,40 +26,55 @@ PLUGIN_NAME = "astrbot_plugin_llm_model_guard"
 #: 统一日志前缀。
 LOG_PREFIX = "[llm_model_guard]"
 
-#: 测活使用的提示词，与框架 ``Provider.test()`` 完全一致。
+#: 验证使用的提示词，与框架 ``Provider.test()`` 完全一致。
 PROBE_PROMPT = "REPLY `PONG` ONLY"
 
-#: 标记作用域的两种取值。
-MARK_SCOPE_GLOBAL = "global"
-MARK_SCOPE_PROFILE = "profile"
+#: 默认可重试的错误类别（``retry_categories`` 的默认值）。
+#:
+#: ``overloaded``（上游瞬时过载）默认**开启**：它通常是稍后就会恢复的瞬时错误，
+#: 不重试就直接标记属于过度惩罚。
+#: ``empty_output`` 默认**不开启**：框架自身对空输出已有 tenacity 重试，
+#: 插件再叠加会放大请求量。
+DEFAULT_RETRY_CATEGORIES: tuple[str, ...] = (
+    "timeout",
+    "rate_limit",
+    "server_error",
+    "network",
+    "overloaded",
+)
 
-#: 兜底路由的 profile_id 归一化值。
-WILDCARD_PROFILE = "*"
+#: 全部合法的 ``retry_categories`` 取值。
+VALID_RETRY_CATEGORIES: frozenset[str] = frozenset(
+    {
+        "timeout",
+        "rate_limit",
+        "server_error",
+        "network",
+        "overloaded",
+        "empty_output",
+    }
+)
 
-#: 日志级别顺序（数值越大越啰嗦）。
-LOG_LEVEL_ORDER: dict[str, int] = {
-    "error": 0,
-    "warning": 1,
-    "info": 2,
-    "debug": 3,
-}
+#: 重试退避的等待上限（秒）。
+MAX_RETRY_BACKOFF_SECONDS = 10.0
 
 
 def log_allowed(configured: str, level: str) -> bool:
-    """``log_level`` 配置是否允许输出该级别的插件日志。"""
-    threshold = LOG_LEVEL_ORDER.get(str(configured or "info").strip().lower(), 2)
-    current = LOG_LEVEL_ORDER.get(str(level).strip().lower(), 2)
-    return current <= threshold
+    """保留旧接口：v0.2.0 已移除 ``log_level`` 配置，恒为 True。
+
+    旧版本插件曾有 ``log_level`` 键；v0.2.0 不再提供该配置项，
+    但保留这个函数以便旧调用点平滑过渡。
+    """
+    return True
 
 
 class ErrorClass(StrEnum):
-    """错误分类枚举（规划文档 §9.2 + 审查修复 P2-6）。"""
+    """错误分类枚举（v0.2.0 保留内置分类表，删除用户自定义规则）。"""
 
     AUTH = "auth"
     MODEL_NOT_FOUND = "model_not_found"
     BAD_REQUEST = "bad_request"
     #: 400/422 但消息没有命中任何细化规则：允许降级，但**不标记**
-    #: （避免把插件自身 payload 不兼容误判成模型永久损坏）。
     BAD_REQUEST_SOFT = "bad_request_soft"
     CONTEXT_TOO_LONG = "context_too_long"
     CONTENT_FILTER = "content_filter"
@@ -68,25 +89,24 @@ class ErrorClass(StrEnum):
 
 
 class Action(StrEnum):
-    """对一次失败的处置动作（规划文档 §4.3）。"""
+    """对一次失败的处置动作。"""
 
     PASSTHROUGH = "passthrough"
     RETRY_SAME = "retry_same"
-    FALLBACK = "fallback"
     RETRY_THEN_FALLBACK = "retry_then_fallback"
+    FALLBACK = "fallback"
     MARK_AND_FALLBACK = "mark_and_fallback"
     SURFACE = "surface"
 
 
 class MarkState(StrEnum):
-    """标记状态机的两种落盘状态（规划文档 §11.1）。
+    """标记状态。
 
-    ``HEALTHY`` 与 ``EXPIRED`` 不落盘：前者表示键不存在，后者是"删除键"这一
-    动作本身，所以这里只有两个状态。
+    v0.2.0 去掉了 ``CONFIRMING`` 双击确认态：恢复条件改为
+    「连续成功 N 次」（``probe_success_threshold``），由计数而非状态机表达。
     """
 
     MARKED = "marked"
-    CONFIRMING = "confirming"
 
 
 class MarkSource(StrEnum):
@@ -107,12 +127,15 @@ class CallKind(StrEnum):
 
 @dataclass(frozen=True)
 class Classification:
-    """一次错误分类的结果，必须可解释（规则名 + 脱敏摘要）。"""
+    """一次错误分类的结果，必须可解释（规则名 + 脱敏摘要）。
+
+    v0.2.0：**没有 TTL**，所以没有 ``mark_ttl``；``mark_delay`` 固定为 1
+    （「连续 N 次才标记」随 v0.1.x 的 ``mark_on_empty_output_after`` 一起移除）。
+    """
 
     error_class: ErrorClass
     action: Action
     should_mark: bool
-    mark_ttl: int
     mark_delay: int = 1
     retry_after: float | None = None
     matched_rule: str = ""
@@ -135,7 +158,6 @@ class Classification:
             "error_class": str(self.error_class),
             "action": str(self.action),
             "should_mark": self.should_mark,
-            "mark_ttl": self.mark_ttl,
             "mark_delay": self.mark_delay,
             "retry_after": self.retry_after,
             "matched_rule": self.matched_rule,
@@ -144,76 +166,8 @@ class Classification:
 
 
 @dataclass(frozen=True)
-class RouteConfig:
-    """一条路由：某个配置文件的主模型与有序回退链。"""
-
-    profile_id: str
-    primary: str = ""
-    fallbacks: tuple[str, ...] = ()
-    max_retries: int | None = None
-    probe_interval: int | None = None
-    probe_timeout: float | None = None
-    enable: bool = True
-    note: str = ""
-
-    @property
-    def is_wildcard(self) -> bool:
-        return self.profile_id == WILDCARD_PROFILE
-
-    @property
-    def is_usable(self) -> bool:
-        """``enable=false`` 或 ``primary`` 为空都视为禁用（规划文档 §7.2-3）。"""
-        return self.enable and bool(self.primary)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "profile_id": self.profile_id,
-            "primary": self.primary,
-            "fallbacks": list(self.fallbacks),
-            "max_retries": self.max_retries,
-            "probe_interval": self.probe_interval,
-            "probe_timeout": self.probe_timeout,
-            "enable": self.enable,
-            "note": self.note,
-        }
-
-
-@dataclass(frozen=True)
-class ProfileRouteConfig:
-    """``profiles`` 里的一条配置：按「配置文件引用」指定主模型与回退链。
-
-    与 :class:`RouteConfig` 的区别只有两点：
-
-    * ``profile_ref`` 允许填**名称**（框架没有 abconf 选择器，插件无法动态注入
-      选项），解析规则见 :mod:`core.routing`；
-    * 它是 ``routes`` 的补充来源，合并时 ``routes`` 优先。
-    """
-
-    profile_ref: str
-    primary: str = ""
-    fallbacks: tuple[str, ...] = ()
-    max_retries: int | None = None
-    probe_interval: int | None = None
-    probe_timeout: float | None = None
-    enable: bool = True
-    note: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "profile_ref": self.profile_ref,
-            "primary": self.primary,
-            "fallbacks": list(self.fallbacks),
-            "max_retries": self.max_retries,
-            "probe_interval": self.probe_interval,
-            "probe_timeout": self.probe_timeout,
-            "enable": self.enable,
-            "note": self.note,
-        }
-
-
-@dataclass(frozen=True)
 class ChainPlan:
-    """一次调用的候选链计划。"""
+    """一次调用的候选链计划（由 :mod:`core.chain` 构建）。"""
 
     candidates: tuple[str, ...] = ()
     bypassed: tuple[str, ...] = ()
@@ -250,25 +204,19 @@ class MarkView:
     reason: str = ""
     detail: str = ""
     marked_at: float = 0.0
-    expires_at: float | None = None
-    first_success_at: float | None = None
-    consecutive_probe_failures: int = 0
+    #: 连续验证成功次数；达到 ``probe_success_threshold`` 即解除标记。
+    consecutive_success: int = 0
     probe_attempts: int = 0
     last_probe_at: float | None = None
     next_probe_at: float | None = None
-    source: str = MarkSource.AUTO
-    profile_hint: str = ""
+    source: MarkSource = MarkSource.AUTO
     mark_count: int = 1
     last_probe_error: str = ""
 
     @property
     def is_pending_confirm(self) -> bool:
-        return self.state is MarkState.CONFIRMING
-
-    def is_expired(self, now: float | None = None) -> bool:
-        if self.expires_at is None:
-            return False
-        return self.expires_at <= (time.time() if now is None else now)
+        """兼容旧字段：v0.2.0 用连续成功计数表达，恒为 False。"""
+        return False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -277,14 +225,11 @@ class MarkView:
             "reason": self.reason,
             "detail": self.detail,
             "marked_at": self.marked_at,
-            "expires_at": self.expires_at,
-            "first_success_at": self.first_success_at,
-            "consecutive_probe_failures": self.consecutive_probe_failures,
+            "consecutive_success": self.consecutive_success,
             "probe_attempts": self.probe_attempts,
             "last_probe_at": self.last_probe_at,
             "next_probe_at": self.next_probe_at,
             "source": str(self.source),
-            "profile_hint": self.profile_hint,
             "mark_count": self.mark_count,
             "last_probe_error": self.last_probe_error,
         }
@@ -332,7 +277,7 @@ class AttemptRecord:
 
 @dataclass(frozen=True)
 class ProbeResult:
-    """一次测活结果。"""
+    """一次验证的结果。"""
 
     provider_id: str
     ok: bool
@@ -409,214 +354,90 @@ def _as_str_list(value: Any) -> tuple[str, ...]:
 
 @dataclass(frozen=True)
 class GuardSettings:
-    """插件配置的不可变快照。
+    """插件配置的不可变快照（v0.2.0：8 个全局键）。
 
-    ``from_mapping()`` 对键名做与 ``_conf_schema.json`` 一致的读取，并对类型做宽松
-    强制转换：配置被手工改坏时退回默认值，而不是让插件崩在启动期。
+    **旧配置里的未知键被静默忽略** —— ``from_mapping`` 只按下面的键名取值，
+    v0.1.x 的 ``routes`` / ``profiles`` / ``mark_scope`` / ``enable_*`` 等键
+    一律不看、不报错。
     """
 
     enable: bool = True
-    enable_routing: bool = True
-    enable_retry: bool = True
-    enable_fallback: bool = True
-    enable_marking: bool = True
-    enable_probe: bool = True
-    enable_monitoring: bool = True
-    unmanaged_monitoring: bool = True
-    respect_manual_selection: bool = True
-    respect_session_selection: bool = True
-    mark_scope: str = MARK_SCOPE_GLOBAL
-    union_framework_fallbacks: bool = True
-    allow_cross_provider_switch_mid_run: bool = False
-    max_retries_per_model: int = 1
-    retry_backoff_base: float = 0.5
-    retry_backoff_factor: float = 2.0
-    retry_backoff_max: float = 8.0
-    retry_jitter_ratio: float = 0.2
-    retry_total_timeout: float = 30.0
-    retry_budget_per_umo_per_minute: int = 20
-    retry_empty_output: bool = False
-    mark_on_empty_output_after: int = 3
-    mark_ttl_default: int = 0
-    mark_ttl_rate_limit: int = 300
-    mark_ttl_server_error: int = 300
-    mark_ttl_network: int = 120
-    double_confirm: bool = True
-    confirm_delay_seconds: int = 60
-    probe_interval_seconds: int = 120
-    probe_timeout_seconds: float = 30.0
-    probe_max_concurrency: int = 2
-    probe_skip_when_busy: bool = True
-    probe_tick_seconds: int = 5
-    probe_on_startup: bool = True
-    stats_window_seconds: int = 900
-    stats_recent_events: int = 200
-    stats_persist_interval_seconds: int = 30
-    #: 统计保留期（天）：仍存在的 provider 永久保留，已删除的按此天数清理；0 = 永久保留。
-    stats_retention_days: int = 7
+    request_timeout_seconds: int = 120
+    max_retries: int = 1
+    retry_backoff_seconds: float = 1.5
+    retry_categories: tuple[str, ...] = DEFAULT_RETRY_CATEGORIES
+    probe_interval_seconds: int = 60
+    probe_timeout_seconds: int = 30
+    probe_success_threshold: int = 2
+    #: 页面写操作总开关（schema 的第 9 个键）。
+    #:
+    #: 默认**关闭**：AstrBot 面板的登录态是**全局**的 —— 默认开启意味着任何
+    #: 能登录 Dashboard 的人都能改全局标记状态，相对 v0.1.x 扩大了误操作面。
+    #: 需要时在插件配置里显式开启即可（该键在 schema 里，用户看得见）。
     allow_webui_actions: bool = False
-    log_level: str = "info"
-    routes: tuple[RouteConfig, ...] = ()
-    error_rules: tuple[Mapping[str, Any], ...] = ()
-    disabled_profiles: frozenset[str] = frozenset()
-    #: ``profiles``：按「配置文件名或 id」表达的路由补充来源。
-    profiles: tuple[ProfileRouteConfig, ...] = ()
-    #: ``fallback_pool``：公共回退池，所有路由共享的有序回退候选。
-    fallback_pool: tuple[str, ...] = ()
 
     # ---- 派生值 ----
 
-    def ttl_for(self, error_class: ErrorClass) -> int:
-        """按分类取标记时长；0 表示不过期（规划文档 §9.3）。"""
-        if error_class in (
-            ErrorClass.RATE_LIMIT,
-            ErrorClass.OVERLOADED,
-            ErrorClass.SERVER_ERROR,
-        ):
-            if error_class is ErrorClass.RATE_LIMIT:
-                return max(0, self.mark_ttl_rate_limit)
-            return max(0, self.mark_ttl_server_error)
-        if error_class in (ErrorClass.TIMEOUT, ErrorClass.NETWORK):
-            return max(0, self.mark_ttl_network)
-        return max(0, self.mark_ttl_default)
+    def is_retryable(self, error_class: Any) -> bool:
+        """该错误类别是否属于「可重试」。
 
-    def route_execution(self, route: RouteConfig | None) -> tuple[int, float, float]:
-        """路由级覆盖：返回 (重试次数, 测活间隔, 测活超时)。"""
-        retries = self.max_retries_per_model
-        interval = float(self.probe_interval_seconds)
-        timeout = self.probe_timeout_seconds
-        if route is not None:
-            if route.max_retries is not None:
-                retries = route.max_retries
-            if route.probe_interval is not None:
-                interval = float(route.probe_interval)
-            if route.probe_timeout is not None:
-                timeout = float(route.probe_timeout)
-        return max(0, retries), max(1.0, interval), max(1.0, timeout)
+        对应流程图里「可重试报错 → 重试」与「不重试报错 → 直接回退」的分叉。
+        """
+        name = str(error_class)
+        return name in self.retry_categories
+
+    def retry_delay(self, attempt: int) -> float:
+        """第 ``attempt`` 次重试前的等待秒数（指数退避，上限 10 秒）。
+
+        ``attempt`` 从 1 开始：第一次重试等待 ``base``，之后翻倍。
+        """
+        base = max(0.0, float(self.retry_backoff_seconds))
+        exponent = max(0, int(attempt) - 1)
+        return min(base * (2.0**exponent), MAX_RETRY_BACKOFF_SECONDS)
+
+    def request_timeout(self) -> float | None:
+        """单次调用超时秒数；``0`` 表示不限制（返回 ``None``）。"""
+        if self.request_timeout_seconds <= 0:
+            return None
+        return float(self.request_timeout_seconds)
 
     def fingerprint(self) -> str:
-        """配置指纹，用于缓存路由表与规则编译结果（规划文档 §7.2-5）。"""
-        parts: list[str] = [
-            str(int(self.enable)),
-            str(int(self.enable_routing)),
-            str(int(self.enable_retry)),
-            str(int(self.enable_fallback)),
-            str(int(self.enable_marking)),
-            str(int(self.enable_probe)),
-            str(int(self.enable_monitoring)),
-            str(int(self.unmanaged_monitoring)),
-            str(int(self.respect_manual_selection)),
-            str(int(self.respect_session_selection)),
-            self.mark_scope,
-            str(int(self.union_framework_fallbacks)),
-            str(int(self.allow_cross_provider_switch_mid_run)),
-            str(self.max_retries_per_model),
-            str(self.retry_backoff_base),
-            str(self.retry_backoff_factor),
-            str(self.retry_backoff_max),
-            str(self.retry_jitter_ratio),
-            str(self.retry_total_timeout),
-            str(self.retry_budget_per_umo_per_minute),
-            str(int(self.retry_empty_output)),
-            str(self.mark_on_empty_output_after),
-            str(self.mark_ttl_default),
-            str(self.mark_ttl_rate_limit),
-            str(self.mark_ttl_server_error),
-            str(self.mark_ttl_network),
-            str(int(self.double_confirm)),
-            str(self.confirm_delay_seconds),
-            str(self.probe_interval_seconds),
-            str(self.probe_timeout_seconds),
-            str(self.probe_max_concurrency),
-            str(int(self.probe_skip_when_busy)),
-            str(self.probe_tick_seconds),
-            str(int(self.probe_on_startup)),
-            str(self.stats_window_seconds),
-            str(self.stats_recent_events),
-            str(self.stats_persist_interval_seconds),
-            str(self.stats_retention_days),
-            str(int(self.allow_webui_actions)),
-            self.log_level,
-        ]
-        for route in self.routes:
-            parts.append(
-                "|".join(
-                    [
-                        route.profile_id,
-                        route.primary,
-                        ",".join(route.fallbacks),
-                        str(route.max_retries),
-                        str(route.probe_interval),
-                        str(route.probe_timeout),
-                        str(int(route.enable)),
-                        route.note,
-                    ]
-                )
-            )
-        for rule in self.error_rules:
-            parts.append(
-                "|".join(
-                    [
-                        _as_str(rule.get("id")),
-                        str(int(_as_bool(rule.get("enabled"), True))),
-                        str(_as_int(rule.get("priority"), 10)),
-                        ",".join(str(v) for v in (rule.get("match_status") or [])),
-                        _as_str(rule.get("match_exc_regex")),
-                        _as_str(rule.get("match_msg_regex")),
-                        _as_str(rule.get("action")),
-                        str(_as_int(rule.get("mark_ttl_seconds"), 0)),
-                    ]
-                )
-            )
-        for profile in self.profiles:
-            parts.append(
-                "|".join(
-                    [
-                        profile.profile_ref,
-                        profile.primary,
-                        ",".join(profile.fallbacks),
-                        str(profile.max_retries),
-                        str(profile.probe_interval),
-                        str(profile.probe_timeout),
-                        str(int(profile.enable)),
-                        profile.note,
-                    ]
-                )
-            )
-        parts.append(",".join(self.fallback_pool))
-        parts.append(",".join(sorted(self.disabled_profiles)))
-        return "\x1f".join(parts)
+        """配置指纹，用于缓存路由表与规则编译结果。"""
+        return "\x1f".join(
+            [
+                str(int(self.enable)),
+                str(self.request_timeout_seconds),
+                str(self.max_retries),
+                f"{self.retry_backoff_seconds:.4f}",
+                ",".join(self.retry_categories),
+                str(self.probe_interval_seconds),
+                str(self.probe_timeout_seconds),
+                str(self.probe_success_threshold),
+                str(int(self.allow_webui_actions)),
+            ]
+        )
 
     def to_public_dict(self) -> dict[str, Any]:
-        """给 Web API / 命令用的只读摘要（不含路由细节）。"""
+        """给 Web API / 命令用的只读摘要。"""
         return {
             "enable": self.enable,
-            "enable_routing": self.enable_routing,
-            "enable_retry": self.enable_retry,
-            "enable_fallback": self.enable_fallback,
-            "enable_marking": self.enable_marking,
-            "enable_probe": self.enable_probe,
-            "enable_monitoring": self.enable_monitoring,
-            "mark_scope": self.mark_scope,
-            "max_retries_per_model": self.max_retries_per_model,
+            "request_timeout_seconds": self.request_timeout_seconds,
+            "max_retries": self.max_retries,
+            "retry_backoff_seconds": self.retry_backoff_seconds,
+            "retry_categories": list(self.retry_categories),
             "probe_interval_seconds": self.probe_interval_seconds,
             "probe_timeout_seconds": self.probe_timeout_seconds,
-            "double_confirm": self.double_confirm,
-            "confirm_delay_seconds": self.confirm_delay_seconds,
-            "mark_ttl_default": self.mark_ttl_default,
-            "stats_retention_days": self.stats_retention_days,
+            "probe_success_threshold": self.probe_success_threshold,
             "allow_webui_actions": self.allow_webui_actions,
-            "log_level": self.log_level,
-            "route_count": len(self.routes),
-            "profile_route_count": len(self.profiles),
-            "fallback_pool_count": len(self.fallback_pool),
-            "error_rule_count": len(self.error_rules),
-            "disabled_profiles": sorted(self.disabled_profiles),
         }
 
     @classmethod
     def from_mapping(cls, config: Mapping[str, Any] | None) -> "GuardSettings":
-        """从插件配置（dict 或 AstrBotConfig）构造快照。"""
+        """从插件配置构造快照。
+
+        **只读取 8 个新键**，其余键（旧版本遗留）一律静默忽略。
+        非法值回退默认并由调用方告警一次。
+        """
         data: Mapping[str, Any] = config or {}
 
         def get(key: str, default: Any) -> Any:
@@ -626,168 +447,28 @@ class GuardSettings:
                 return default
             return default if value is None else value
 
-        routes: list[RouteConfig] = []
-        raw_routes = get("routes", []) or []
-        if isinstance(raw_routes, Mapping):
-            raw_routes = list(raw_routes.values())
-        if isinstance(raw_routes, Iterable) and not isinstance(raw_routes, (str, bytes)):
-            for item in raw_routes:
-                if isinstance(item, Mapping):
-                    route = route_from_mapping(item)
-                    if route is not None:
-                        routes.append(route)
-
-        rules: list[Mapping[str, Any]] = []
-        raw_rules = get("error_rules", []) or []
-        if isinstance(raw_rules, Mapping):
-            raw_rules = list(raw_rules.values())
-        if isinstance(raw_rules, Iterable) and not isinstance(raw_rules, (str, bytes)):
-            for item in raw_rules:
-                if isinstance(item, Mapping):
-                    rules.append(dict(item))
-
-        profiles: list[ProfileRouteConfig] = []
-        raw_profiles = get("profiles", []) or []
-        if isinstance(raw_profiles, Mapping):
-            raw_profiles = list(raw_profiles.values())
-        if isinstance(raw_profiles, Iterable) and not isinstance(raw_profiles, (str, bytes)):
-            for item in raw_profiles:
-                if isinstance(item, Mapping):
-                    profile = profile_route_from_mapping(item)
-                    if profile is not None:
-                        profiles.append(profile)
-
-        fallback_pool = _as_str_list(get("fallback_pool", []))
+        raw_categories = _as_str_list(get("retry_categories", DEFAULT_RETRY_CATEGORIES))
+        categories = tuple(
+            item for item in raw_categories if item in VALID_RETRY_CATEGORIES
+        )
+        if not categories:
+            categories = DEFAULT_RETRY_CATEGORIES
 
         return cls(
             enable=_as_bool(get("enable", True), True),
-            enable_routing=_as_bool(get("enable_routing", True), True),
-            enable_retry=_as_bool(get("enable_retry", True), True),
-            enable_fallback=_as_bool(get("enable_fallback", True), True),
-            enable_marking=_as_bool(get("enable_marking", True), True),
-            enable_probe=_as_bool(get("enable_probe", True), True),
-            enable_monitoring=_as_bool(get("enable_monitoring", True), True),
-            unmanaged_monitoring=_as_bool(get("unmanaged_monitoring", True), True),
-            respect_manual_selection=_as_bool(get("respect_manual_selection", True), True),
-            respect_session_selection=_as_bool(get("respect_session_selection", True), True),
-            mark_scope=_as_str(get("mark_scope", MARK_SCOPE_GLOBAL), MARK_SCOPE_GLOBAL)
-            or MARK_SCOPE_GLOBAL,
-            union_framework_fallbacks=_as_bool(get("union_framework_fallbacks", True), True),
-            allow_cross_provider_switch_mid_run=_as_bool(
-                get("allow_cross_provider_switch_mid_run", False), False
+            request_timeout_seconds=max(0, _as_int(get("request_timeout_seconds", 120), 120)),
+            max_retries=max(0, _as_int(get("max_retries", 1), 1)),
+            retry_backoff_seconds=max(
+                0.0, _as_float(get("retry_backoff_seconds", 1.5), 1.5)
             ),
-            max_retries_per_model=max(0, _as_int(get("max_retries_per_model", 1), 1)),
-            retry_backoff_base=max(0.0, _as_float(get("retry_backoff_base", 0.5), 0.5)),
-            retry_backoff_factor=max(1.0, _as_float(get("retry_backoff_factor", 2.0), 2.0)),
-            retry_backoff_max=max(0.0, _as_float(get("retry_backoff_max", 8.0), 8.0)),
-            retry_jitter_ratio=min(1.0, max(0.0, _as_float(get("retry_jitter_ratio", 0.2), 0.2))),
-            retry_total_timeout=max(0.0, _as_float(get("retry_total_timeout", 30.0), 30.0)),
-            retry_budget_per_umo_per_minute=max(
-                0, _as_int(get("retry_budget_per_umo_per_minute", 20), 20)
+            retry_categories=categories,
+            probe_interval_seconds=max(1, _as_int(get("probe_interval_seconds", 60), 60)),
+            probe_timeout_seconds=max(1, _as_int(get("probe_timeout_seconds", 30), 30)),
+            probe_success_threshold=max(
+                1, _as_int(get("probe_success_threshold", 2), 2)
             ),
-            retry_empty_output=_as_bool(get("retry_empty_output", False), False),
-            mark_on_empty_output_after=max(0, _as_int(get("mark_on_empty_output_after", 3), 3)),
-            mark_ttl_default=max(0, _as_int(get("mark_ttl_default", 0), 0)),
-            mark_ttl_rate_limit=max(0, _as_int(get("mark_ttl_rate_limit", 300), 300)),
-            mark_ttl_server_error=max(0, _as_int(get("mark_ttl_server_error", 300), 300)),
-            mark_ttl_network=max(0, _as_int(get("mark_ttl_network", 120), 120)),
-            double_confirm=_as_bool(get("double_confirm", True), True),
-            confirm_delay_seconds=max(0, _as_int(get("confirm_delay_seconds", 60), 60)),
-            probe_interval_seconds=max(1, _as_int(get("probe_interval_seconds", 120), 120)),
-            probe_timeout_seconds=max(1.0, _as_float(get("probe_timeout_seconds", 30.0), 30.0)),
-            probe_max_concurrency=max(1, _as_int(get("probe_max_concurrency", 2), 2)),
-            probe_skip_when_busy=_as_bool(get("probe_skip_when_busy", True), True),
-            probe_tick_seconds=max(1, _as_int(get("probe_tick_seconds", 5), 5)),
-            probe_on_startup=_as_bool(get("probe_on_startup", True), True),
-            stats_window_seconds=max(0, _as_int(get("stats_window_seconds", 900), 900)),
-            stats_recent_events=max(0, _as_int(get("stats_recent_events", 200), 200)),
-            stats_persist_interval_seconds=max(
-                1, _as_int(get("stats_persist_interval_seconds", 30), 30)
-            ),
-            stats_retention_days=max(0, _as_int(get("stats_retention_days", 7), 7)),
             allow_webui_actions=_as_bool(get("allow_webui_actions", False), False),
-            log_level=_as_str(get("log_level", "info"), "info") or "info",
-            routes=tuple(routes),
-            error_rules=tuple(rules),
-            disabled_profiles=frozenset(_as_str_list(get("disabled_profiles", []))),
-            profiles=tuple(profiles),
-            fallback_pool=fallback_pool,
         )
-
-
-def route_from_mapping(item: Mapping[str, Any]) -> RouteConfig | None:
-    """把 ``routes``/``default_route`` 里的一条配置转成 :class:`RouteConfig`。
-
-    ``-1`` 表示继承全局设置；``profile_id`` 为 ``*``/空视为兜底路由。
-    """
-    if not isinstance(item, Mapping):
-        return None
-
-    raw_profile = _as_str(item.get("profile_id"))
-    profile_id = raw_profile if raw_profile else WILDCARD_PROFILE
-    primary = _as_str(item.get("primary"))
-    fallbacks = tuple(
-        fid for fid in _as_str_list(item.get("fallbacks", ())) if fid and fid != primary
-    )
-
-    def _optional_int(key: str) -> int | None:
-        value = item.get(key, -1)
-        number = _as_int(value, -1)
-        return None if number < 0 else number
-
-    def _optional_float(key: str) -> float | None:
-        value = item.get(key, -1)
-        number = _as_float(value, -1.0)
-        return None if number < 0 else number
-
-    return RouteConfig(
-        profile_id=profile_id,
-        primary=primary,
-        fallbacks=fallbacks,
-        max_retries=_optional_int("max_retries"),
-        probe_interval=_optional_int("probe_interval_seconds"),
-        probe_timeout=_optional_float("probe_timeout_seconds"),
-        enable=_as_bool(item.get("enable", True), True),
-        note=_as_str(item.get("note")),
-    )
-
-
-def profile_route_from_mapping(item: Mapping[str, Any]) -> ProfileRouteConfig | None:
-    """把 ``profiles`` 里的一条配置转成 :class:`ProfileRouteConfig`。
-
-    ``profile_ref`` 允许填**名称**或**id**（框架没有 abconf 选择器，插件无法在
-    schema 里动态注入选项）；空值视为兜底路由（等价于 ``routes`` 里的 ``*``）。
-    """
-    if not isinstance(item, Mapping):
-        return None
-
-    raw_ref = _as_str(item.get("profile_ref")) or _as_str(item.get("profile"))
-    profile_ref = raw_ref if raw_ref else WILDCARD_PROFILE
-    primary = _as_str(item.get("primary"))
-    fallbacks = tuple(
-        fid for fid in _as_str_list(item.get("fallbacks", ())) if fid and fid != primary
-    )
-
-    def _optional_int(key: str) -> int | None:
-        value = item.get(key, -1)
-        number = _as_int(value, -1)
-        return None if number < 0 else number
-
-    def _optional_float(key: str) -> float | None:
-        value = item.get(key, -1)
-        number = _as_float(value, -1.0)
-        return None if number < 0 else number
-
-    return ProfileRouteConfig(
-        profile_ref=profile_ref,
-        primary=primary,
-        fallbacks=fallbacks,
-        max_retries=_optional_int("max_retries"),
-        probe_interval=_optional_int("probe_interval_seconds"),
-        probe_timeout=_optional_float("probe_timeout_seconds"),
-        enable=_as_bool(item.get("enable", True), True),
-        note=_as_str(item.get("note")),
-    )
 
 
 @dataclass
@@ -799,14 +480,12 @@ class MarkBlock:
     reason: str = ""
     detail: str = ""
     marked_at: float = 0.0
-    expires_at: float | None = None
-    first_success_at: float | None = None
-    consecutive_probe_failures: int = 0
+    #: 连续验证成功次数（v0.2.0 的恢复判据）。
+    consecutive_success: int = 0
     probe_attempts: int = 0
     last_probe_at: float | None = None
     next_probe_at: float | None = None
-    source: str = MarkSource.AUTO
-    profile_hint: str = ""
+    source: MarkSource = MarkSource.AUTO
     mark_count: int = 1
     last_probe_error: str = ""
 
@@ -817,14 +496,11 @@ class MarkBlock:
             reason=self.reason,
             detail=self.detail,
             marked_at=self.marked_at,
-            expires_at=self.expires_at,
-            first_success_at=self.first_success_at,
-            consecutive_probe_failures=self.consecutive_probe_failures,
+            consecutive_success=self.consecutive_success,
             probe_attempts=self.probe_attempts,
             last_probe_at=self.last_probe_at,
             next_probe_at=self.next_probe_at,
             source=self.source,
-            profile_hint=self.profile_hint,
             mark_count=self.mark_count,
             last_probe_error=self.last_probe_error,
         )
@@ -834,15 +510,13 @@ class MarkBlock:
 
     @classmethod
     def from_dict(cls, provider_id: str, data: Mapping[str, Any]) -> "MarkBlock":
-        """从状态文件恢复；字段缺失用默认值补（规划文档 §8.3）。"""
+        """从状态文件恢复；字段缺失用默认值补。"""
         state_raw = _as_str(data.get("state"), str(MarkState.MARKED))
         try:
             state = MarkState(state_raw)
         except ValueError:
             state = MarkState.MARKED
-        expires = data.get("expires_at")
         next_probe = data.get("next_probe_at")
-        first_success = data.get("first_success_at")
         last_probe = data.get("last_probe_at")
         return cls(
             provider_id=provider_id,
@@ -850,14 +524,18 @@ class MarkBlock:
             reason=_as_str(data.get("reason")),
             detail=_as_str(data.get("detail")),
             marked_at=_as_float(data.get("marked_at"), 0.0),
-            expires_at=_as_float(expires, 0.0) if expires not in (None, "") else None,
-            first_success_at=_as_float(first_success, 0.0) if first_success not in (None, "") else None,
-            consecutive_probe_failures=max(0, _as_int(data.get("consecutive_probe_failures"), 0)),
+            consecutive_success=max(
+                0, _as_int(data.get("consecutive_success"), 0)
+            ),
             probe_attempts=max(0, _as_int(data.get("probe_attempts"), 0)),
-            last_probe_at=_as_float(last_probe, 0.0) if last_probe not in (None, "") else None,
-            next_probe_at=_as_float(next_probe, 0.0) if next_probe not in (None, "") else None,
-            source=_as_str(data.get("source"), MarkSource.AUTO) or MarkSource.AUTO,
-            profile_hint=_as_str(data.get("profile_hint")),
+            last_probe_at=(
+                _as_float(last_probe, 0.0) if last_probe not in (None, "") else None
+            ),
+            next_probe_at=(
+                _as_float(next_probe, 0.0) if next_probe not in (None, "") else None
+            ),
+            source=_as_str(data.get("source"), str(MarkSource.AUTO))
+            or str(MarkSource.AUTO),
             mark_count=max(1, _as_int(data.get("mark_count"), 1)),
             last_probe_error=_as_str(data.get("last_probe_error")),
         )
@@ -875,7 +553,7 @@ class CallContext:
     umo: str | None = None
     profile_id: str | None = None
     requested: str = ""
-    route: RouteConfig | None = None
+    route: Any | None = None
     created_at: float = field(default_factory=time.time)
     attempted: set[str] = field(default_factory=set)
 

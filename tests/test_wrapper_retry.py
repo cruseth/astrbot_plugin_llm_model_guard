@@ -1,4 +1,12 @@
-"""包装层（非流式）单测：重试、退避、降级、标记与异常上抛。"""
+"""包装层（非流式）单测（v0.2.0）：超时、重试、回退、标记与异常上抛。
+
+v0.2.0 的语义变化：
+
+* 链路**直接读框架**（默认模型 + ``fallback_chat_models``），不再由配置指定；
+* 重试次数由 ``max_retries`` 决定，可重试的类别由 ``retry_categories`` 决定；
+* 退避是**指数**的（``retry_backoff_seconds`` × 2^(n-1)，上限 10 秒）；
+* 单次调用有超时（``request_timeout_seconds``）。
+"""
 
 from __future__ import annotations
 
@@ -20,20 +28,20 @@ def make_runtime(
     primary_results: list,
     fallback_results: list | None = None,
     config: dict | None = None,
+    fallbacks: list[str] | None = None,
 ):
+    """构造 runtime：p1 是该配置文件的默认模型，p2 是它的回退模型。"""
     primary = FakeProvider("p1", results=primary_results)
     fallback = FakeProvider("p2", results=fallback_results or [FakeResponse("p2-ok")])
-    merged = {
-        "routes": [
-            {"profile_id": "default", "primary": "p1", "fallbacks": ["p2"]},
-        ],
-        **(config or {}),
-    }
     runtime = build_runtime(
         tmp_path,
-        config=merged,
+        config=dict(config or {}),
         providers=[primary, fallback],
         profiles={UMO: "default"},
+        defaults={"default": "p1"},
+        conf_fallbacks={
+            "default": fallbacks if fallbacks is not None else ["p2"]
+        },
     )
     return runtime, primary, fallback
 
@@ -43,11 +51,16 @@ def call(runtime, provider, **kwargs):
     return asyncio.run(runtime.guard.handle_text_chat(provider, (), payload))
 
 
+# ---------------------------------------------------------------------------
+# 重试
+# ---------------------------------------------------------------------------
+
+
 def test_retry_then_success(tmp_path: Path) -> None:
     runtime, primary, _ = make_runtime(
         tmp_path,
         primary_results=[StatusError("rate limit", 429), FakeResponse("p1-ok")],
-        config={"max_retries_per_model": 2},
+        config={"max_retries": 1},
     )
     response = call(runtime, primary)
     assert response.completion_text == "p1-ok"
@@ -57,57 +70,119 @@ def test_retry_then_success(tmp_path: Path) -> None:
     assert [event["ok"] for event in events] == [True, False]
 
 
-def test_backoff_sequence(tmp_path: Path) -> None:
+def test_backoff_is_exponential(tmp_path: Path) -> None:
+    """退避是指数的：base、base×2、base×4…（上限 10 秒）。"""
     runtime, primary, fallback = make_runtime(
         tmp_path,
         primary_results=[StatusError("rate limit", 429)],
-        config={
-            "max_retries_per_model": 2,
-            "retry_backoff_base": 0.5,
-            "retry_backoff_factor": 2.0,
-            "retry_jitter_ratio": 0.0,
-            "retry_backoff_max": 100.0,
-        },
+        config={"max_retries": 2, "retry_backoff_seconds": 0.5},
     )
     response = call(runtime, primary)
-    # 重试两次（0.5s、1.0s）后仍失败 → 降级到 p2 成功
     assert runtime.sleep.delays == [0.5, 1.0]
     assert response.completion_text == "p2-ok"
     assert primary.call_count == 3
     assert fallback.call_count == 1
 
 
-def test_retry_after_honored(tmp_path: Path) -> None:
-    error = StatusError("rate limit", 429)
-    from .support import ResponseLike
-
-    error.response = ResponseLike(429, {"retry-after": "2"})
+def test_backoff_capped_at_ten_seconds(tmp_path: Path) -> None:
+    """退避上限 10 秒。"""
     runtime, primary, _ = make_runtime(
         tmp_path,
-        primary_results=[error, FakeResponse("p1-ok")],
-        config={"max_retries_per_model": 1, "retry_backoff_max": 8.0},
+        primary_results=[StatusError("rate limit", 429)],
+        config={"max_retries": 3, "retry_backoff_seconds": 100.0},
     )
-    assert call(runtime, primary).completion_text == "p1-ok"
-    assert runtime.sleep.delays == [2.0]
+    call(runtime, primary)
+    assert runtime.sleep.delays == [10.0, 10.0, 10.0]
 
 
-def test_retry_budget_exhausted(tmp_path: Path) -> None:
+def test_max_retries_zero_means_no_retry(tmp_path: Path) -> None:
     runtime, primary, fallback = make_runtime(
         tmp_path,
         primary_results=[StatusError("rate limit", 429)],
-        config={"max_retries_per_model": 3, "retry_budget_per_umo_per_minute": 1},
+        config={"max_retries": 0},
     )
     response = call(runtime, primary)
     assert response.completion_text == "p2-ok"
-    assert len(runtime.sleep.delays) == 1
-    assert fallback.call_count == 1
+    assert primary.call_count == 1
+    assert runtime.sleep.delays == []
+
+
+def test_retry_categories_gate_retry(tmp_path: Path) -> None:
+    """不在 ``retry_categories`` 里的类别**不重试**，直接回退并标记。"""
+    runtime, primary, fallback = make_runtime(
+        tmp_path,
+        primary_results=[StatusError("rate limit", 429)],
+        config={
+            "max_retries": 3,
+            "retry_categories": ["timeout"],  # 不含 rate_limit
+        },
+    )
+    response = call(runtime, primary)
+    assert response.completion_text == "p2-ok"
+    assert primary.call_count == 1, "不在可重试类别里就不该重试"
+    assert runtime.sleep.delays == []
+    assert runtime.guardian.is_marked("p1") is True
+
+
+def test_retry_categories_can_include_rate_limit(tmp_path: Path) -> None:
+    runtime, primary, _ = make_runtime(
+        tmp_path,
+        primary_results=[StatusError("rate limit", 429), FakeResponse("p1-ok")],
+        config={"max_retries": 1, "retry_categories": ["rate_limit"]},
+    )
+    assert call(runtime, primary).completion_text == "p1-ok"
+    assert primary.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# 回退与标记
+# ---------------------------------------------------------------------------
+
+
+def test_overloaded_is_retried_by_default(tmp_path: Path) -> None:
+    """529 / overloaded 是瞬时错误：默认就该重试同一模型，而不是直接标记。"""
+    runtime, primary, _ = make_runtime(
+        tmp_path,
+        primary_results=[StatusError("overloaded", 529), FakeResponse("p1-ok")],
+        config={"max_retries": 1},
+    )
+    assert call(runtime, primary).completion_text == "p1-ok"
+    assert primary.call_count == 2, "overloaded 应当重试"
+    assert runtime.sleep.delays
+
+
+def test_empty_output_is_not_retried_by_default(tmp_path: Path) -> None:
+    """空输出默认不重试（框架自身已有 tenacity 重试，插件叠加会放大请求量）。"""
+    empty_error = RuntimeError("EmptyModelOutputError: no usable assistant output")
+    runtime, primary, fallback = make_runtime(
+        tmp_path,
+        primary_results=[empty_error],
+        config={"max_retries": 3},
+    )
+    response = call(runtime, primary)
+    assert response.completion_text == "p2-ok"
+    assert primary.call_count == 1, "插件层不应重试空输出"
+    assert runtime.sleep.delays == []
+
+
+def test_empty_output_can_be_made_retryable(tmp_path: Path) -> None:
+    """把 ``empty_output`` 加进配置后，它就变成可重试。"""
+    empty_error = RuntimeError("EmptyModelOutputError: no usable assistant output")
+    runtime, primary, _ = make_runtime(
+        tmp_path,
+        primary_results=[empty_error, FakeResponse("p1-ok")],
+        config={"max_retries": 1, "retry_categories": ["empty_output"]},
+    )
+    assert call(runtime, primary).completion_text == "p1-ok"
+    assert primary.call_count == 2
 
 
 def test_no_retry_on_auth_and_marks(tmp_path: Path) -> None:
+    """鉴权失败不在可重试类别里 → 不重试、直接回退并标记。"""
     runtime, primary, fallback = make_runtime(
         tmp_path,
         primary_results=[StatusError("invalid api key", 401)],
-        config={"max_retries_per_model": 3},
+        config={"max_retries": 3},
     )
     response = call(runtime, primary)
     assert response.completion_text == "p2-ok"
@@ -138,24 +213,12 @@ def test_model_kwarg_dropped_for_fallback(tmp_path: Path) -> None:
     assert fallback.calls[0]["model"] is None
 
 
-def test_continuation_no_cross_switch(tmp_path: Path) -> None:
-    runtime, primary, fallback = make_runtime(
-        tmp_path,
-        primary_results=[StatusError("invalid api key", 401)],
-        config={"max_retries_per_model": 1},
-    )
-    with pytest.raises(StatusError):
-        call(runtime, primary, tool_calls_result=[{"tool_call_id": "abc"}])
-    assert fallback.call_count == 0
-    assert primary.call_count == 2  # 只重试同一模型
-
-
 def test_chain_all_failed_raises_last(tmp_path: Path) -> None:
     runtime, primary, fallback = make_runtime(
         tmp_path,
         primary_results=[StatusError("internal server error", 500)],
         fallback_results=[StatusError("bad gateway", 502)],
-        config={"max_retries_per_model": 0},
+        config={"max_retries": 0},
     )
     with pytest.raises(StatusError) as excinfo:
         call(runtime, primary)
@@ -177,8 +240,8 @@ def test_all_candidates_marked_uses_first(tmp_path: Path) -> None:
         tmp_path,
         primary_results=[FakeResponse("p1-ok")],
     )
-    asyncio.run(runtime.guardian.mark("p1", reason="auth", ttl=0))
-    asyncio.run(runtime.guardian.mark("p2", reason="auth", ttl=0))
+    asyncio.run(runtime.guardian.mark("p1", reason="auth"))
+    asyncio.run(runtime.guardian.mark("p2", reason="auth"))
     response = call(runtime, primary)
     assert response.completion_text == "p1-ok"
     assert runtime.metrics.counters["all_candidates_marked"] >= 1
@@ -225,7 +288,9 @@ def test_probe_prompt_is_passthrough(tmp_path: Path) -> None:
                 {"prompt": "REPLY `PONG` ONLY", "session_id": UMO},
             )
         )
-    assert primary.call_count == 1
+    # 验证提示词走旁路：算一次 probe 调用，不算普通对话调用。
+    assert primary.probe_call_count == 1
+    assert primary.call_count == 0
     assert fallback.call_count == 0
 
 
@@ -256,21 +321,84 @@ def test_unmanaged_call_only_records(tmp_path: Path) -> None:
     assert events[0]["used"] == "solo"
 
 
-def test_routing_disabled_still_retries_same_model(tmp_path: Path) -> None:
-    """关掉「接管选择」只影响选谁，不影响对框架所选模型的重试/标记。"""
-    runtime, primary, fallback = make_runtime(
+# ---------------------------------------------------------------------------
+# 超时
+# ---------------------------------------------------------------------------
+
+
+def test_request_timeout_triggers_retry(tmp_path: Path) -> None:
+    """超时按「timeout」类别处理：可重试类别里有它就会重试。"""
+
+    class _SlowProvider(FakeProvider):
+        async def text_chat(self, **kwargs):  # type: ignore[override]
+            self.call_count += 1
+            self.calls.append(dict(kwargs))
+            await asyncio.sleep(10)
+            return FakeResponse("never")
+
+    slow = _SlowProvider("p1")
+    runtime = build_runtime(
         tmp_path,
-        primary_results=[StatusError("rate limit", 429), FakeResponse("p1-ok")],
-        config={"enable_routing": False, "max_retries_per_model": 1},
+        config={
+            "request_timeout_seconds": 1,
+            "max_retries": 0,
+        },
+        providers=[slow],
+        profiles={UMO: "default"},
+        defaults={"default": "p1"},
+        conf_fallbacks={"default": []},
     )
-    response = call(runtime, primary)
-    assert response.completion_text == "p1-ok"
-    assert primary.call_count == 2
-    assert fallback.call_count == 0
+    with pytest.raises((asyncio.TimeoutError, TimeoutError)):
+        call(runtime, slow)
+    assert slow.call_count == 1
+
+
+def test_request_timeout_zero_means_no_limit(tmp_path: Path) -> None:
+    """``request_timeout_seconds=0`` 表示不限制。"""
+    settings = runtime_settings({"request_timeout_seconds": 0})
+    assert settings.request_timeout() is None
+    assert settings.request_timeout_seconds == 0
+
+
+def runtime_settings(config: dict) -> object:
+    from astrbot_plugin_llm_model_guard.core.models import GuardSettings
+
+    return GuardSettings.from_mapping(config)
 
 
 # ---------------------------------------------------------------------------
-# 第 2 轮修复：P2-1 / P2-2 / P2-3 / P2-4 / P3-1 / P3-9
+# 本地编程错误
+# ---------------------------------------------------------------------------
+
+
+def test_local_type_error_surfaces_without_fallback(tmp_path: Path) -> None:
+    """本地 TypeError 直接上抛：不重试、不换模型、不标记。"""
+    runtime, primary, fallback = make_runtime(
+        tmp_path,
+        primary_results=[TypeError("unexpected keyword argument")],
+        config={"max_retries": 3},
+    )
+    with pytest.raises(TypeError):
+        call(runtime, primary)
+    assert primary.call_count == 1
+    assert fallback.call_count == 0
+    assert runtime.guardian.has_marked() is False
+
+
+def test_local_value_error_surfaces_without_fallback(tmp_path: Path) -> None:
+    runtime, primary, fallback = make_runtime(
+        tmp_path,
+        primary_results=[ValueError("bad value")],
+    )
+    with pytest.raises(ValueError):
+        call(runtime, primary)
+    assert primary.call_count == 1
+    assert fallback.call_count == 0
+    assert runtime.guardian.has_marked() is False
+
+
+# ---------------------------------------------------------------------------
+# 框架二次进入
 # ---------------------------------------------------------------------------
 
 
@@ -282,57 +410,49 @@ def _second_entry(runtime, fallback, kwargs) -> str:
 
 
 def test_framework_second_entry_does_not_retry_marked_candidate(tmp_path: Path) -> None:
-    """框架降级二次进入时不得重打链首坏模型（P2-1）。"""
+    """框架降级二次进入时不得重打链首坏模型。"""
     from astrbot_plugin_llm_model_guard.core.wrapper import CALL_CONTEXT
 
     runtime, primary, fallback = make_runtime(
         tmp_path,
         primary_results=[StatusError("invalid api key", 401)],
-        config={"max_retries_per_model": 0},
+        config={"max_retries": 0},
     )
     payload = {"prompt": "你好", "session_id": UMO}
 
     async def _whole_flow() -> str:
-        # 模拟 hook 已经把 CallContext 写进 contextvar（真实链路就是这样）
         context = runtime.guard.resolve_call_context(payload, provider_id="p1")
         CALL_CONTEXT.set(context)
         first = await runtime.guard.handle_text_chat(primary, (), payload)
         assert first.completion_text == "p2-ok"
-        # 框架降级后再次进入包装层：这次 provider 是 p2，但共享同一个 CallContext
         second = await runtime.guard.handle_text_chat(fallback, (), payload)
         return second.completion_text
 
     assert asyncio.run(_whole_flow()) == "p2-ok"
-    # 链首坏模型只被请求 1 次，且已被标记
     assert primary.call_count == 1
     assert runtime.guardian.is_marked("p1") is True
     assert runtime.metrics.counters.get("framework_fallback_hops", 0) >= 1
 
 
 def test_skip_marked_candidate_without_attempt_history(tmp_path: Path) -> None:
-    """被标记的候选不会再有请求（P2-1：即使没有 attempt 记录也不打）。"""
+    """被标记的候选不会再有请求。"""
     runtime, primary, fallback = make_runtime(
         tmp_path,
         primary_results=[FakeResponse("p1-ok")],
-        config={"max_retries_per_model": 0},
+        config={"max_retries": 0},
     )
-    asyncio.run(runtime.guardian.mark("p1", reason="auth", ttl=0))
+    asyncio.run(runtime.guardian.mark("p1", reason="auth"))
     response = call(runtime, primary)
     assert response.completion_text == "p2-ok"
     assert primary.call_count == 0
 
 
 def test_abort_signal_interrupts_backoff(tmp_path: Path) -> None:
-    """用户点“停止生成”时退避应立即中断（P2-2）。"""
+    """用户点“停止生成”时退避应立即中断。"""
     runtime, primary, _ = make_runtime(
         tmp_path,
         primary_results=[StatusError("rate limit", 429)],
-        config={
-            "max_retries_per_model": 3,
-            "retry_backoff_base": 5.0,
-            "retry_backoff_max": 5.0,
-            "retry_jitter_ratio": 0.0,
-        },
+        config={"max_retries": 3, "retry_backoff_seconds": 5.0},
     )
     runtime.guard._sleep_fn = None  # 使用真实的分段 sleep，才能验证 abort
 
@@ -354,99 +474,46 @@ def test_abort_signal_interrupts_backoff(tmp_path: Path) -> None:
     assert primary.call_count == 1
 
 
-def test_modality_incompatible_fallback_is_skipped(tmp_path: Path) -> None:
-    """请求带图片而回退模型没声明 image 能力时跳过该候选（P2-3）。"""
-    primary = FakeProvider("p1", results=[StatusError("invalid api key", 401)])
-    fallback = FakeProvider("p2", results=[FakeResponse("p2-ok")])
-    fallback.provider_config["modalities"] = ["text"]
-    third = FakeProvider("p3", results=[FakeResponse("p3-ok")])
-    third.provider_config["modalities"] = ["image", "text"]
+# ---------------------------------------------------------------------------
+# 链路相关
+# ---------------------------------------------------------------------------
 
+
+def test_chain_comes_from_framework_config(tmp_path: Path) -> None:
+    """链路直接读框架：默认模型 + 该配置文件的回退列表。"""
+    runtime, primary, fallback = make_runtime(
+        tmp_path,
+        primary_results=[FakeResponse("p1-ok")],
+    )
+    plan = runtime.guard.build_plan(umo=UMO)
+    assert plan.candidates == ("p1", "p2")
+
+
+def test_chain_follows_session_level_selection(tmp_path: Path) -> None:
+    """会话级模型切换会被链路自动纳入（链首是它）。"""
+    primary = FakeProvider("p1", results=[FakeResponse("p1-ok")])
+    second = FakeProvider("p2", results=[FakeResponse("p2-ok")])
     runtime = build_runtime(
         tmp_path,
-        config={
-            "routes": [
-                {"profile_id": "default", "primary": "p1", "fallbacks": ["p2", "p3"]},
-            ],
-            "max_retries_per_model": 0,
-        },
-        providers=[primary, fallback, third],
+        config={},
+        providers=[primary, second],
         profiles={UMO: "default"},
+        defaults={"default": "p1"},
+        conf_fallbacks={"default": ["p2"]},
+        session_provider={UMO: "p2"},
     )
-    response = asyncio.run(
-        runtime.guard.handle_text_chat(
-            primary,
-            (),
-            {"prompt": "看图", "session_id": UMO, "image_urls": ["http://img"]},
-        )
-    )
-    assert response.completion_text == "p3-ok"
-    assert fallback.call_count == 0
-    assert runtime.metrics.counters.get("candidate_modality_incompatible", 0) >= 1
-
-
-def test_modality_unknown_means_support_all(tmp_path: Path) -> None:
-    """modalities 为空 = 未配置 = 全支持（与框架语义一致）。"""
-    primary = FakeProvider("p1", results=[StatusError("invalid api key", 401)])
-    fallback = FakeProvider("p2", results=[FakeResponse("p2-ok")])
-    runtime = build_runtime(
-        tmp_path,
-        config={
-            "routes": [
-                {"profile_id": "default", "primary": "p1", "fallbacks": ["p2"]},
-            ],
-            "max_retries_per_model": 0,
-        },
-        providers=[primary, fallback],
-        profiles={UMO: "default"},
-    )
-    response = asyncio.run(
-        runtime.guard.handle_text_chat(
-            primary,
-            (),
-            {"prompt": "看图", "session_id": UMO, "image_urls": ["http://img"]},
-        )
-    )
-    assert response.completion_text == "p2-ok"
-    assert fallback.call_count == 1
-
-
-def test_defaults_do_not_retry_empty_output(tmp_path: Path) -> None:
-    """默认配置下空输出不在插件层重试，交给框架 tenacity（P2-4）。"""
-    empty_error = RuntimeError("EmptyModelOutputError: no usable assistant output")
-    primary = FakeProvider("p1", results=[empty_error])
-    fallback = FakeProvider("p2", results=[FakeResponse("p2-ok")])
-    runtime = build_runtime(
-        tmp_path,
-        config={
-            "routes": [
-                {"profile_id": "default", "primary": "p1", "fallbacks": ["p2"]},
-            ]
-        },
-        providers=[primary, fallback],
-        profiles={UMO: "default"},
-    )
-    settings = runtime.guard.settings
-    assert settings.max_retries_per_model == 1
-    assert settings.retry_empty_output is False
-
-    response = asyncio.run(
-        runtime.guard.handle_text_chat(
-            primary, (), {"prompt": "hi", "session_id": UMO}
-        )
-    )
-    assert response.completion_text == "p2-ok"
-    assert primary.call_count == 1  # 插件层没有重试空输出
-    assert runtime.sleep.delays == []
+    plan = runtime.guard.build_plan(umo=UMO)
+    assert plan.candidates[0] == "p2"
+    assert plan.source == "manual" or plan.candidates[0] == "p2"
 
 
 def test_chain_failure_annotates_last_classification(tmp_path: Path) -> None:
-    """全链失败时把最后一次分类摘要附到异常上（P3-9）。"""
+    """全链失败时把最后一次分类摘要附到异常上。"""
     runtime, primary, fallback = make_runtime(
         tmp_path,
         primary_results=[StatusError("internal server error", 500)],
         fallback_results=[StatusError("bad gateway", 502)],
-        config={"max_retries_per_model": 0},
+        config={"max_retries": 0},
     )
     with pytest.raises(StatusError) as excinfo:
         call(runtime, primary)
@@ -455,26 +522,12 @@ def test_chain_failure_annotates_last_classification(tmp_path: Path) -> None:
     assert any("server_error" in note for note in notes)
 
 
-def test_local_type_error_surfaces_without_fallback(tmp_path: Path) -> None:
-    """本地 TypeError 直接上抛，不再换模型（P2-8 在包装层的行为）。"""
-    runtime, primary, fallback = make_runtime(
-        tmp_path,
-        primary_results=[TypeError("unexpected keyword argument")],
-        config={"max_retries_per_model": 3},
-    )
-    with pytest.raises(TypeError):
-        call(runtime, primary)
-    assert primary.call_count == 1
-    assert fallback.call_count == 0
-    assert runtime.guardian.has_marked() is False
-
-
 def test_408_is_retried(tmp_path: Path) -> None:
-    """408/409/425 走重试路径（P2-7 在包装层的验证）。"""
+    """408 走重试路径。"""
     runtime, primary, _ = make_runtime(
         tmp_path,
         primary_results=[StatusError("request timeout", 408), FakeResponse("p1-ok")],
-        config={"max_retries_per_model": 1},
+        config={"max_retries": 1},
     )
     assert call(runtime, primary).completion_text == "p1-ok"
     assert primary.call_count == 2

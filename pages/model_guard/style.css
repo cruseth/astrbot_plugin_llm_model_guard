@@ -421,13 +421,6 @@ html[data-theme="dark"] .lm-btn--primary {
   font-size: 13px;
 }
 
-.lm-table caption {
-  padding: 0 0 8px;
-  color: var(--lm-text-mute);
-  font-size: 12px;
-  text-align: left;
-}
-
 .lm-table th,
 .lm-table td {
   padding: 9px 10px;
@@ -460,17 +453,6 @@ html[data-theme="dark"] .lm-btn--primary {
   font-family: "Consolas", "Cascadia Mono", "SFMono-Regular", monospace;
   font-size: 12px;
   word-break: break-all;
-}
-
-.lm-ellipsis {
-  display: inline-block;
-  max-width: 260px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  vertical-align: bottom;
-  color: var(--lm-text-dim);
-  font-size: 12px;
 }
 
 .lm-row-actions {
@@ -527,18 +509,19 @@ html[data-theme="dark"] .lm-btn--primary {
   margin-left: 6px;
 }
 
-/* ---------- 标记详情 ---------- */
 
-.lm-mark-list {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+/* ---------- 链路视图 ---------- */
+
+.lm-chain-list {
+  display: flex;
+  flex-direction: column;
   gap: 10px;
   margin: 0;
   padding: 0;
   list-style: none;
 }
 
-.lm-mark-item {
+.lm-chain-item {
   padding: 12px 14px;
   background: var(--lm-surface-2);
   border: 1px solid var(--lm-border);
@@ -546,37 +529,80 @@ html[data-theme="dark"] .lm-btn--primary {
   min-width: 0;
 }
 
-.lm-mark-head {
+.lm-chain-head {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
+  align-items: baseline;
   justify-content: space-between;
-  gap: 6px;
+  gap: 4px 10px;
 }
 
-.lm-mark-id {
-  font-family: "Consolas", "Cascadia Mono", "SFMono-Regular", monospace;
-  font-size: 12px;
+.lm-chain-name {
+  font-size: 14px;
   font-weight: 700;
+  color: var(--lm-text);
   word-break: break-all;
 }
 
-.lm-kv {
-  display: grid;
-  grid-template-columns: 84px 1fr;
-  gap: 2px 10px;
-  margin: 8px 0 0;
-  font-size: 12px;
-}
-
-.lm-kv dt {
+.lm-chain-meta {
   color: var(--lm-text-mute);
+  font-size: 11px;
+  word-break: break-all;
 }
 
-.lm-kv dd {
-  margin: 0;
-  color: var(--lm-text);
+/* 横向流水线：窄屏自动换行，长 id 也不溢出 */
+.lm-pipeline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.lm-pipeline-step {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 3px 10px;
+  background: var(--lm-surface);
+  border: 1px solid var(--lm-border);
+  border-radius: 999px;
+  font-size: 12px;
+  min-width: 0;
+}
+
+.lm-pipeline-id {
+  overflow-wrap: anywhere;
+}
+
+/* 被标记的模型：删除线 + 醒目配色，标签本身不加删除线 */
+.lm-pipeline-step--marked {
+  background: var(--lm-danger-soft);
+  border-color: var(--lm-danger);
+}
+
+.lm-pipeline-step--marked .lm-pipeline-id {
+  color: var(--lm-danger);
+  text-decoration: line-through;
+  text-decoration-thickness: 2px;
+}
+
+.lm-pipeline-arrow {
+  color: var(--lm-text-mute);
+  font-size: 12px;
+  user-select: none;
+}
+
+.lm-chain-note {
+  margin: 8px 0 0;
+  color: var(--lm-text-dim);
+  font-size: 12px;
   word-break: break-word;
+}
+
+.lm-chain-note--warn {
+  color: var(--lm-warn);
 }
 
 /* ---------- 空状态 / 加载 ---------- */

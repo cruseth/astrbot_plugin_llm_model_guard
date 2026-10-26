@@ -24,7 +24,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from astrbot_plugin_llm_model_guard.core.guardian import Guardian
 from astrbot_plugin_llm_model_guard.core.metrics import Metrics
-from astrbot_plugin_llm_model_guard.core.models import GuardSettings
+from astrbot_plugin_llm_model_guard.core.models import PROBE_PROMPT, GuardSettings
 from astrbot_plugin_llm_model_guard.core.store import StateStore
 from astrbot_plugin_llm_model_guard.core.wrapper import Guard
 
@@ -142,6 +142,8 @@ class FakeProvider:
         self._stream_results: list[Sequence[Any]] = list(stream_results or [])
         self.hang = hang
         self.call_count = 0
+        #: supervisor 自动验证的调用次数（与 ``call_count`` 分开统计）。
+        self.probe_call_count = 0
         self.stream_call_count = 0
         self.calls: list[dict[str, Any]] = []
         self.stream_calls: list[dict[str, Any]] = []
@@ -161,7 +163,12 @@ class FakeProvider:
     # ---- 调用 ----
 
     async def text_chat(self, **kwargs: Any) -> Any:
-        self.call_count += 1
+        # 验证请求用的是 PROBE_PROMPT；单独计数，便于测试区分
+        # 「用户对话调用」与「supervisor 的自动验证调用」。
+        if kwargs.get("prompt") == PROBE_PROMPT:
+            self.probe_call_count += 1
+        else:
+            self.call_count += 1
         self.calls.append(dict(kwargs))
         if self.hang:
             await asyncio.sleep(3600)
@@ -204,15 +211,48 @@ class FakeProvider:
 
 
 class FakeProviderManager:
-    def __init__(self, providers: Iterable[FakeProvider] = ()) -> None:
+    """最小 ``ProviderManager`` 替身。
+
+    v0.2.0：链路直接读框架，因此这里要实现框架的优先级语义：
+
+    1. **会话级隔离**（``session_provider``）：按 umo 指定；
+    2. 该 umo 所属 abconf 的 ``default_provider_id``；
+    3. 兜底 ``provider_insts[0]``。
+    """
+
+    def __init__(
+        self,
+        providers: Iterable[FakeProvider] = (),
+        *,
+        acm: Any = None,
+        session_provider: Mapping[str, str] | None = None,
+    ) -> None:
         self.inst_map: dict[str, FakeProvider] = {p.provider_id: p for p in providers}
         self.provider_insts: list[FakeProvider] = list(self.inst_map.values())
+        self.acm = acm
+        self.session_provider = dict(session_provider or {})
 
     def add(self, provider: FakeProvider) -> FakeProvider:
         self.inst_map[provider.provider_id] = provider
         if provider not in self.provider_insts:
             self.provider_insts.append(provider)
         return provider
+
+    def get_using_provider(self, provider_type: Any = None, umo: Any = None) -> Any:
+        """框架语义的实现：会话级 → abconf 默认 → 首个实例。"""
+        umo_key = umo if isinstance(umo, str) else ""
+        session_id = self.session_provider.get(umo_key)
+        if session_id:
+            provider = self.inst_map.get(session_id)
+            if provider is not None:
+                return provider
+        if self.acm is not None:
+            default_id = self.acm.default_provider_of(umo_key)
+            if default_id:
+                provider = self.inst_map.get(default_id)
+                if provider is not None:
+                    return provider
+        return self.provider_insts[0] if self.provider_insts else None
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +261,14 @@ class FakeProviderManager:
 
 
 class FakeAcm:
-    """最小 ``AstrBotConfigManager`` 替身。"""
+    """最小 ``AstrBotConfigManager`` 替身。
+
+    v0.2.0 需要提供：
+
+    * ``get_conf(umo)`` —— 返回该 umo 所属 abconf（含 ``provider_settings``）；
+    * ``get_conf_list()`` —— 全部配置文件；
+    * ``confs`` —— ``profile_id → abconf``（页面按 id 读默认模型时用）。
+    """
 
     def __init__(
         self,
@@ -229,10 +276,20 @@ class FakeAcm:
         profiles: Mapping[str, str] | None = None,
         fallbacks: Mapping[str, Sequence[str]] | None = None,
         names: Mapping[str, str] | None = None,
+        defaults: Mapping[str, str] | None = None,
+        conf_fallbacks: Mapping[str, Sequence[str]] | None = None,
     ) -> None:
         self.profiles = dict(profiles or {})
         self.fallbacks = {key: list(value) for key, value in (fallbacks or {}).items()}
         self.names = dict(names or {})
+        #: ``profile_id → default_provider_id``。
+        self.defaults = dict(defaults or {})
+        #: ``profile_id → fallback_chat_models``（按配置文件配置，而不是按 umo）。
+        self.conf_fallbacks = {
+            key: list(value) for key, value in (conf_fallbacks or {}).items()
+        }
+
+    # ---- 框架接口 ----
 
     def get_conf_info(self, umo: str) -> dict[str, Any] | None:
         profile_id = self.profiles.get(umo)
@@ -241,9 +298,15 @@ class FakeAcm:
         return {"id": profile_id, "name": self.names.get(profile_id, profile_id), "path": ""}
 
     def get_conf(self, umo: str) -> dict[str, Any]:
+        profile_id = self.profiles.get(umo, "default")
         return {
             "provider_settings": {
-                "fallback_chat_models": list(self.fallbacks.get(umo, [])),
+                "default_provider_id": self.defaults.get(profile_id, ""),
+                "fallback_chat_models": list(
+                    self.conf_fallbacks.get(
+                        profile_id, self.fallbacks.get(umo, [])
+                    )
+                ),
             }
         }
 
@@ -252,10 +315,33 @@ class FakeAcm:
         for profile_id in self.profiles.values():
             if profile_id not in seen:
                 seen.append(profile_id)
+        for profile_id in self.defaults:
+            if profile_id not in seen:
+                seen.append(profile_id)
         return [
             {"id": profile_id, "name": self.names.get(profile_id, profile_id), "path": ""}
             for profile_id in seen
         ]
+
+    # ---- 辅助（给测试与插件内部用） ----
+
+    @property
+    def confs(self) -> dict[str, dict[str, Any]]:
+        """``profile_id → abconf``（只读视图）。"""
+        result: dict[str, dict[str, Any]] = {}
+        for profile_id in {*self.profiles.values(), *self.defaults}:
+            result[profile_id] = {
+                "provider_settings": {
+                    "default_provider_id": self.defaults.get(profile_id, ""),
+                    "fallback_chat_models": list(
+                        self.conf_fallbacks.get(profile_id, [])
+                    ),
+                }
+            }
+        return result
+
+    def default_provider_of(self, umo: str) -> str:
+        return self.defaults.get(self.profiles.get(umo, "default"), "")
 
 
 class FakeContext:
@@ -267,9 +353,14 @@ class FakeContext:
         *,
         acm: Any = None,
         current_provider: FakeProvider | None = None,
+        session_provider: Mapping[str, str] | None = None,
     ) -> None:
-        self.provider_manager = FakeProviderManager(providers)
         self.astrbot_config_mgr = acm if acm is not None else FakeAcm()
+        self.provider_manager = FakeProviderManager(
+            providers,
+            acm=self.astrbot_config_mgr,
+            session_provider=session_provider,
+        )
         self._current_provider = current_provider
         self.registered_web_apis: list[tuple[Any, ...]] = []
         self.config: dict[str, Any] = {}
@@ -352,13 +443,23 @@ def build_runtime(
     providers: Iterable[FakeProvider] = (),
     profiles: Mapping[str, str] | None = None,
     fallbacks: Mapping[str, Sequence[str]] | None = None,
+    defaults: Mapping[str, str] | None = None,
+    conf_fallbacks: Mapping[str, Sequence[str]] | None = None,
+    names: Mapping[str, str] | None = None,
+    session_provider: Mapping[str, str] | None = None,
     current_provider: FakeProvider | None = None,
     use_real_sleep: bool = False,
 ) -> Runtime:
     """构造 Guardian + Guard + FakeContext；时间与 sleep 全部可控。
 
-    ``use_real_sleep=True`` 时使用 Guard 自带的分段 ``asyncio.sleep``（用于验证
-    ``abort_signal`` 能真的打断退避，见 P2-2 的用例）。
+    v0.2.0 的链路相关参数：
+
+    * ``profiles``：``umo → profile_id``（决定该会话用哪个配置文件）；
+    * ``defaults``：``profile_id → default_provider_id``（该配置文件的默认模型）；
+    * ``conf_fallbacks``：``profile_id → fallback_chat_models``（该配置文件的有序回退链）；
+    * ``session_provider``：``umo → provider_id``（会话级模型选择，优先级最高）。
+
+    ``use_real_sleep=True`` 时使用 Guard 自带的分段 ``asyncio.sleep``。
     """
     reset_call_context()
     config_dict: dict[str, Any] = dict(config or {})
@@ -367,13 +468,21 @@ def build_runtime(
     sleep = SleepRecorder(monotonic)
     sleep_fn = None if use_real_sleep else sleep
     provider_list = list(providers)
+    acm = FakeAcm(
+        profiles=profiles,
+        fallbacks=fallbacks,
+        defaults=defaults,
+        conf_fallbacks=conf_fallbacks,
+        names=names,
+    )
     context = FakeContext(
         provider_list,
-        acm=FakeAcm(profiles=profiles, fallbacks=fallbacks),
+        acm=acm,
         current_provider=current_provider,
+        session_provider=session_provider,
     )
     metrics = Metrics(window_s=900, recent_cap=200, clock=clock)
-    store = StateStore(tmp_path, clock=clock, plugin_version="0.1.0")
+    store = StateStore(tmp_path, clock=clock, plugin_version="0.2.0")
 
     holder: dict[str, Any] = {}
 

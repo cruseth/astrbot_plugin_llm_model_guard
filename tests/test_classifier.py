@@ -47,7 +47,6 @@ def test_404_model_not_found() -> None:
     classifier = make_classifier()
     result = classifier.classify(StatusError("model does not exist", 404))
     assert result.error_class is ErrorClass.MODEL_NOT_FOUND
-    assert result.mark_ttl == 0
 
 
 def test_400_model_not_found_by_message() -> None:
@@ -65,12 +64,13 @@ def test_429_quota_beats_rate_limit() -> None:
     assert result.allows_retry is False
 
 
-def test_429_rate_limit_retryable_and_ttl() -> None:
-    classifier = make_classifier({"mark_ttl_rate_limit": 42})
+def test_429_rate_limit_retryable() -> None:
+    """v0.2.0：没有 TTL 了；限流仍属于「可重试」类别。"""
+    classifier = make_classifier()
     result = classifier.classify(StatusError("Rate limit reached for requests", 429))
     assert result.error_class is ErrorClass.RATE_LIMIT
     assert result.allows_retry is True
-    assert result.mark_ttl == 42
+    assert result.should_mark is True
 
 
 def test_content_filter_before_bad_request() -> None:
@@ -111,7 +111,7 @@ def test_network_by_cause_chain() -> None:
     classifier = make_classifier()
     result = classifier.classify(error)
     assert result.error_class is ErrorClass.NETWORK
-    assert result.mark_ttl == 120
+    assert result.should_mark is True
 
 
 def test_server_error_503_is_overloaded() -> None:
@@ -128,21 +128,18 @@ def test_server_error_503_is_overloaded() -> None:
 
 
 def test_empty_output_by_name() -> None:
+    """v0.2.0：空输出直接按策略标记，没有「连续 N 次」的延迟。"""
+
     class EmptyModelOutputError(Exception):
         pass
 
-    classifier = make_classifier({"mark_on_empty_output_after": 3})
+    classifier = make_classifier()
     result = classifier.classify(EmptyModelOutputError("empty output"))
     assert result.error_class is ErrorClass.EMPTY_OUTPUT
-    assert result.mark_delay == 3
-    # 默认 retry_empty_output=false：空输出交给框架自己的 tenacity（P2-4）
-    assert result.allows_retry is False
+    assert result.mark_delay == 1
+    assert result.should_mark is True
+    assert result.allows_retry is True
     assert result.allows_fallback is True
-
-    retrying = make_classifier(
-        {"mark_on_empty_output_after": 3, "retry_empty_output": True}
-    )
-    assert retrying.classify(EmptyModelOutputError("empty output")).allows_retry is True
 
 
 def test_unknown_fallback() -> None:
@@ -154,7 +151,8 @@ def test_unknown_fallback() -> None:
     assert result.allows_fallback is True
 
 
-def test_user_rule_priority() -> None:
+def test_user_rules_removed_in_v2() -> None:
+    """v0.2.0 删除了「自定义错误规则」：传入的规则被忽略，走内置规则。"""
     rules = [
         {
             "id": "my-rule",
@@ -168,22 +166,22 @@ def test_user_rule_priority() -> None:
     ]
     classifier = make_classifier(rules=rules)
     result = classifier.classify(StatusError("内部错误，请稍后重试", 500))
-    assert result.matched_rule == "user:my-rule"
-    assert result.action is Action.RETRY_SAME
+    assert result.matched_rule == "builtin:server_error"
     assert result.error_class is ErrorClass.SERVER_ERROR
+    # 用户规则不再参与：rule_count 只反映内置规则数。
+    assert classifier.rule_count > 0
+    assert classifier.reload_rules(rules) == 0
 
 
 def test_invalid_user_regex_skipped() -> None:
+    """v0.2.0：非法正则的用户规则被忽略（规则功能已整体移除）。"""
     rules = [
         {"id": "bad", "priority": 1, "match_msg_regex": "([unclosed", "action": "surface"},
-        {"id": "bad-action", "priority": 2, "action": "explode"},
-        {"id": "good", "priority": 3, "match_msg_regex": "boom", "action": "surface"},
     ]
     classifier = make_classifier(rules=rules)
-    assert classifier.rule_count == 1
+    assert classifier.reload_rules(rules) == 0
     result = classifier.classify(RuntimeError("boom"))
-    assert result.matched_rule == "user:good"
-    assert result.action is Action.SURFACE
+    assert result.matched_rule == "builtin:unknown"
 
 
 def test_err_response_classification() -> None:
@@ -204,32 +202,27 @@ def test_stream_chunks_force_surface() -> None:
     assert result.action is Action.SURFACE
     # 已产出内容后既不重试也不标记（任务包 02 §3.4 / 裁决 P2-5）
     assert result.should_mark is False
-    assert result.mark_ttl == 0
 
 
-def test_continuation_blocks_cross_provider_switch() -> None:
+def test_continuation_allows_cross_provider_switch() -> None:
+    """v0.2.0：回退是框架既有能力，工具循环后续轮也允许换模型。"""
     classifier = make_classifier()
     result = classifier.classify(StatusError("invalid api key", 401), is_continuation=True)
-    assert result.action is Action.RETRY_SAME
-    assert result.allows_fallback is False
-
-    relaxed = make_classifier({"allow_cross_provider_switch_mid_run": True})
-    assert relaxed.classify(
-        StatusError("invalid api key", 401), is_continuation=True
-    ).allows_fallback is True
+    assert result.allows_fallback is True
+    assert result.should_mark is True
 
 
-def test_switches_disable_actions() -> None:
-    no_mark = make_classifier({"enable_marking": False})
-    result = no_mark.classify(StatusError("invalid api key", 401))
-    assert result.should_mark is False
-    assert result.mark_ttl == 0
+def test_no_switch_toggles_in_v2() -> None:
+    """v0.2.0：``enable_marking`` 等开关已移除，标记只由总开关控制。"""
+    classifier = make_classifier({"enable_marking": False})
+    result = classifier.classify(StatusError("invalid api key", 401))
+    # 旧键被静默忽略：标记照常进行。
+    assert result.should_mark is True
 
+    # ``enable_retry`` / ``enable_fallback`` 同样被忽略：是否重试由
+    # ``retry_categories`` 决定（在 Guard 层），不由分类器决定。
     no_retry = make_classifier({"enable_retry": False})
-    assert no_retry.classify(StatusError("rate limit", 429)).allows_retry is False
-
-    no_fallback = make_classifier({"enable_fallback": False})
-    assert no_fallback.classify(StatusError("rate limit", 429)).action is Action.SURFACE
+    assert no_retry.classify(StatusError("rate limit", 429)).allows_retry is True
 
 
 def test_retry_after_is_parsed() -> None:
@@ -272,7 +265,6 @@ def test_400_generic_does_not_mark() -> None:
     assert result.error_class is ErrorClass.BAD_REQUEST_SOFT
     assert result.matched_rule == "builtin:bad_request_generic"
     assert result.should_mark is False
-    assert result.mark_ttl == 0
     assert result.allows_fallback is True
     assert result.allows_retry is False
 

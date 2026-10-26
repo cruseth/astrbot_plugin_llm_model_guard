@@ -1,8 +1,8 @@
 name: "astrbot_plugin_llm_model_guard"
 display_name: LLM 模型守护
-desc: "按配置文件接管 LLM 模型选择：错误分类、同模型重试、降级回退链、临时标记与自动测活，并提供调用统计与只读监控页面。"
-short_description: "模型出错自动重试/降级/标记，定期测活恢复"
-version: "0.1.0"
+desc: "按框架已有的模型顺序接管 LLM 模型选择：超时、同模型重试、自动回退、标记坏模型与定时验证恢复。配置只有 8 项，零模型 id。"
+short_description: "模型出错自动重试/回退/标记，定时验证恢复"
+version: "0.2.0"
 author: "AstrBot Agent"
 repo: "https://github.com/cruseth/astrbot_plugin_llm_model_guard"
 astrbot_version: ">=4.25"

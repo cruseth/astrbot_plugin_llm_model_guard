@@ -194,3 +194,78 @@ def test_write_sync_uses_unique_tmp_files(tmp_path: Path) -> None:
     second = store.write_sync({"schema_version": SCHEMA_VERSION, "marks": {}})
     assert first == second == store.path
     assert list(tmp_path.glob("state.json.*.tmp")) == []
+
+
+# ---------------------------------------------------------------------------
+# v0.2.0：schema_version 1 → 2 迁移
+# ---------------------------------------------------------------------------
+
+
+def test_schema_version_is_two() -> None:
+    assert SCHEMA_VERSION == 2
+
+
+def test_v1_migration_drops_profile_dimension(tmp_path: Path) -> None:
+    """v1 → v2：丢弃 ``marks_by_profile``，保留全局 ``marks``。"""
+    store = make_store(tmp_path)
+    v1 = {
+        "schema_version": 1,
+        "marks": {
+            "p1": {
+                "state": "marked",
+                "reason": "auth",
+                "expires_at": 12345.0,
+                "first_success_at": 999.0,
+                "profile_hint": "default",
+                "consecutive_probe_failures": 2,
+            }
+        },
+        "marks_by_profile": {
+            "default::p2": {"state": "marked", "reason": "rate_limit"},
+        },
+        "providers": {"p1": {"calls": 3}},
+    }
+    store.path.write_text(json.dumps(v1), encoding="utf-8")
+    state = store.load()
+
+    assert state["schema_version"] == 2
+    # 全局标记保留
+    assert "p1" in state["marks"]
+    assert state["marks"]["p1"]["reason"] == "auth"
+    # profile 维度被丢弃
+    assert "marks_by_profile" not in state
+    assert "p2" not in state["marks"]
+    # TTL 与双击确认态字段被清掉
+    assert "expires_at" not in state["marks"]["p1"]
+    assert "first_success_at" not in state["marks"]["p1"]
+    assert "profile_hint" not in state["marks"]["p1"]
+    # v2 的恢复判据是连续成功计数，从 0 开始重新累计
+    assert state["marks"]["p1"]["consecutive_success"] == 0
+    assert state["marks"]["p1"]["state"] == "marked"
+    # 统计保留
+    assert state["providers"]["p1"]["calls"] == 3
+    # 迁移前先备份
+    assert (tmp_path / "state.v1.bak.json").exists()
+
+
+def test_v1_migration_resets_confirming_state(tmp_path: Path) -> None:
+    """v1 的 ``confirming`` 态在 v2 里统一归为 ``marked``。"""
+    store = make_store(tmp_path)
+    v1 = {
+        "schema_version": 1,
+        "marks": {"p1": {"state": "confirming", "reason": "auth"}},
+    }
+    store.path.write_text(json.dumps(v1), encoding="utf-8")
+    state = store.load()
+    assert state["marks"]["p1"]["state"] == "marked"
+
+
+def test_v1_migration_keeps_empty_marks(tmp_path: Path) -> None:
+    """空的 v1 状态也能迁移。"""
+    store = make_store(tmp_path)
+    store.path.write_text(
+        json.dumps({"schema_version": 1, "marks": {}}), encoding="utf-8"
+    )
+    state = store.load()
+    assert state["schema_version"] == 2
+    assert state["marks"] == {}

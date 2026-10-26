@@ -1,12 +1,23 @@
 """Web API 视图：只读汇总 + 受开关约束的写操作。
 
-约定（规划文档 §14.2 + 主 Agent 裁决）：
+v0.2.0 的端点清单（任务包 12 §4.3）：
+
+* ``GET  /overview`` —— 总览（开关、统计、模型列表、标记、链路、配置）
+* ``GET  /chains`` —— **每个框架配置文件的只读链路视图**
+* ``GET  /events`` —— 最近调用记录
+* ``POST /mark``、``/unmark``、``/probe``、``/reload``
+
+已删除（v0.1.x）：``/profiles``、``/schema_refresh``、``/routes``、``/health``。
+
+约定：
 
 * 注册 route 必须形如 ``/astrbot_plugin_llm_model_guard/<endpoint>``，
   因为前端桥接把 endpoint 拼成 ``/api/plug/<pluginName>/<endpoint>``；
 * 响应体是仪表盘信封 ``{"status": "ok", "data": {...}}`` /
   ``{"status": "error", "message": "..."}``；
-* 写操作（mark / unmark / probe）受 ``allow_webui_actions`` 门控，默认关闭。
+* 写操作受 ``allow_webui_actions`` 门控，**默认关闭**（该键在 schema 里，
+  用户可在插件配置中开启）。``/overview`` 的 ``runtime.allow_actions``
+  反映真实配置值，页面据此显示/隐藏操作按钮。
 
 本模块不导入 AstrBot：视图函数返回纯 dict，``main.py`` 负责 ``jsonify``。
 """
@@ -14,22 +25,17 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Awaitable, Callable, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Mapping
 
-from .models import MARK_SCOPE_PROFILE, MarkState
-from .routing import describe_route, describe_warning, resolve_profile_ref
+from .models import MarkState
 
 #: 注册路由的统一前缀（必须与插件名一致）。
 ROUTE_PREFIX = "/astrbot_plugin_llm_model_guard"
 
 #: 只读端点。
 ROUTE_OVERVIEW = f"{ROUTE_PREFIX}/overview"
-ROUTE_ROUTES = f"{ROUTE_PREFIX}/routes"
+ROUTE_CHAINS = f"{ROUTE_PREFIX}/chains"
 ROUTE_EVENTS = f"{ROUTE_PREFIX}/events"
-ROUTE_HEALTH = f"{ROUTE_PREFIX}/health"
-ROUTE_PROFILES = f"{ROUTE_PREFIX}/profiles"
-#: 重新注入 schema 选项（幂等）；框架里新建/删除配置文件后可手动触发。
-ROUTE_SCHEMA_REFRESH = f"{ROUTE_PREFIX}/schema_refresh"
 
 #: 写端点。
 ROUTE_MARK = f"{ROUTE_PREFIX}/mark"
@@ -92,11 +98,7 @@ def _provider_model_name(guard: Any, provider_id: str) -> str:
 
 
 def collect_providers(guard: Any) -> list[dict[str, Any]]:
-    """``ProviderStat`` 列表：统计 + 模型名 + 标记状态。
-
-    标记状态取**全部作用域**的视图（``mark_index``），因此
-    ``mark_scope="profile"`` 下的标记也能在页面看到（P1-1）。
-    """
+    """``ProviderStat`` 列表：统计 + 模型名 + 标记状态。"""
     stats = guard.metrics.per_provider()
     marks = guard.guardian.mark_index()
     known_ids = list(guard.provider_ids())
@@ -129,142 +131,114 @@ def collect_providers(guard: Any) -> list[dict[str, Any]]:
     return result
 
 
-def collect_routes(guard: Any) -> list[dict[str, Any]]:
-    """``RouteView`` 列表：按路由表顺序输出（标记视图取全部作用域，P1-1）。"""
-    settings = guard.settings
-    marks = guard.guardian.mark_index()
-    known_ids = guard.provider_ids()
-    names = profile_name_map(guard)
-    result: list[dict[str, Any]] = []
-    for profile_id, route in guard.route_table.items():
-        result.append(
-            describe_route(
-                route,
-                marks=marks,
-                known_ids=known_ids,
-                fallback_ids=(),
-                fallback_pool=settings.fallback_pool,
-                union_framework_fallbacks=settings.union_framework_fallbacks,
-                profile_name=names.get(profile_id),
-            )
-        )
-    if settings.disabled_profiles:
-        for code in sorted(settings.disabled_profiles):
-            result.append(
-                {
-                    "profile_id": code,
-                    "profile_name": names.get(code, code),
-                    "profile_display": (
-                        f"{names[code]} ({code})" if code in names else code
-                    ),
-                    "primary": "",
-                    "fallbacks": [],
-                    "effective_chain": [],
-                    "source": "disabled",
-                    "marked": [],
-                    "bypassed": [],
-                    "degraded_use": None,
-                    "missing": [],
-                    "warnings": [
-                        {"code": "profile_disabled", "message": describe_warning("profile_disabled")}
-                    ],
-                    "enable": False,
-                    "note": "",
-                }
-            )
-    return result
-
-
-def profile_name_map(guard: Any) -> dict[str, str]:
-    """``{profile_id: 配置文件名}``；取不到名称时返回空映射。"""
-    entries = getattr(guard, "profile_entries", None) or []
-    result: dict[str, str] = {}
-    for entry in entries:
-        if not isinstance(entry, Mapping):
-            continue
-        profile_id = str(entry.get("id") or "").strip()
-        if not profile_id:
-            continue
-        name = str(entry.get("name") or "").strip()
-        if name and name != profile_id:
-            result[profile_id] = name
-    return result
-
-
-def collect_profiles(guard: Any) -> list[dict[str, Any]]:
-    """所有配置文件（abconf）的 id、名字与当前默认模型，便于页面展示与排查。
-
-    框架没有 abconf 选择器，插件用这个只读接口把「可选的配置文件」暴露给页面，
-    用户不必手抄 uuid。
-    """
+def _conf_list(guard: Any) -> list[dict[str, str]]:
+    """框架里的配置文件列表（id / name / path）。"""
     acm = guard.acm
-    known_ids = set(guard.provider_ids())
     getter = getattr(acm, "get_conf_list", None)
-    profiles: list[dict[str, Any]] = []
+    entries: list[dict[str, str]] = []
     if callable(getter):
         try:
             for info in getter() or []:
                 if isinstance(info, Mapping):
-                    profiles.append(
+                    profile_id = str(info.get("id") or "").strip()
+                    if not profile_id:
+                        continue
+                    entries.append(
                         {
-                            "profile_id": str(info.get("id") or ""),
-                            "name": str(info.get("name") or info.get("id") or ""),
+                            "id": profile_id,
+                            "name": str(info.get("name") or profile_id),
                             "path": str(info.get("path") or ""),
                         }
                     )
         except Exception:
-            profiles = []
-    if not any(item.get("profile_id") == "default" for item in profiles):
-        profiles.insert(0, {"profile_id": "default", "name": "default", "path": ""})
-
-    result: list[dict[str, Any]] = []
-    for item in profiles:
-        profile_id = item["profile_id"]
-        default_provider = _profile_default_provider(guard, profile_id)
-        result.append(
-            {
-                "id": profile_id,
-                "profile_id": profile_id,
-                "name": item["name"],
-                "path": item["path"],
-                "is_default": profile_id == "default",
-                "default_provider": default_provider,
-                "default_provider_exists": (
-                    default_provider in known_ids if default_provider else None
-                ),
-                "display": (
-                    f"{item['name']} ({profile_id})"
-                    if item["name"] and item["name"] != profile_id
-                    else profile_id
-                ),
-            }
-        )
-    return result
+            entries = []
+    if not any(item["id"] == "default" for item in entries):
+        entries.insert(0, {"id": "default", "name": "default", "path": ""})
+    return entries
 
 
-def _profile_default_provider(guard: Any, profile_id: str) -> str:
-    """读某个配置文件当前的默认 provider（``provider_settings.default_provider_id``）。"""
+def _abconf_of(guard: Any, profile_id: str) -> Mapping[str, Any] | None:
+    """取某个配置文件的 abconf 内容（用于读默认模型与回退列表）。"""
     acm = guard.acm
-    getter = getattr(acm, "get_conf", None)
-    if not callable(getter):
-        return ""
-    conf = None
-    # 框架的 ``get_conf(umo)`` 需要 umo；配置文件 id 走 ``confs`` 字典更直接。
     confs = getattr(acm, "confs", None)
     if isinstance(confs, Mapping) and profile_id in confs:
         conf = confs[profile_id]
-    else:
+        if isinstance(conf, Mapping):
+            return conf
+    getter = getattr(acm, "get_conf", None)
+    if callable(getter):
         try:
             conf = getter(profile_id)
         except Exception:
-            conf = None
+            return None
+        if isinstance(conf, Mapping):
+            return conf
+    return None
+
+
+def _default_provider_of(conf: Mapping[str, Any] | None) -> str:
     if not isinstance(conf, Mapping):
         return ""
-    settings_block = conf.get("provider_settings")
-    if not isinstance(settings_block, Mapping):
+    settings = conf.get("provider_settings")
+    if not isinstance(settings, Mapping):
         return ""
-    value = settings_block.get("default_provider_id")
+    value = settings.get("default_provider_id")
     return value.strip() if isinstance(value, str) else ""
+
+
+def _fallbacks_of(conf: Mapping[str, Any] | None) -> list[str]:
+    if not isinstance(conf, Mapping):
+        return []
+    settings = conf.get("provider_settings")
+    if not isinstance(settings, Mapping):
+        return []
+    fallbacks = settings.get("fallback_chat_models")
+    if not isinstance(fallbacks, (list, tuple)):
+        return []
+    return [item.strip() for item in fallbacks if isinstance(item, str) and item.strip()]
+
+
+def collect_chains(guard: Any) -> list[dict[str, Any]]:
+    """**每个框架配置文件**的只读链路视图。
+
+    这是「兼容框架每个配置文件（模型顺序）」的可视化：链路直接来自框架配置，
+    插件**没有**对应的配置项（v0.2.0 的配置里零 id）。
+    """
+    marked = set(guard.guardian.marked_ids())
+    known = set(guard.provider_ids())
+    result: list[dict[str, Any]] = []
+    for entry in _conf_list(guard):
+        profile_id = entry["id"]
+        conf = _abconf_of(guard, profile_id)
+        default_provider = _default_provider_of(conf)
+        fallbacks = _fallbacks_of(conf)
+
+        ordered: list[str] = []
+        for provider_id in (default_provider, *fallbacks):
+            if provider_id and provider_id not in ordered:
+                ordered.append(provider_id)
+        missing = [pid for pid in ordered if known and pid not in known]
+        bypassed = [pid for pid in ordered if pid in marked]
+
+        result.append(
+            {
+                "profile_id": profile_id,
+                "profile_name": entry["name"],
+                "profile_display": (
+                    f"{entry['name']} ({profile_id})"
+                    if entry["name"] and entry["name"] != profile_id
+                    else profile_id
+                ),
+                "path": entry["path"],
+                "is_default": profile_id == "default",
+                "default_provider": default_provider,
+                "fallbacks": fallbacks,
+                "chain": [pid for pid in ordered if pid not in bypassed],
+                "marked": bypassed,
+                "missing": missing,
+            }
+        )
+    return result
 
 
 def build_overview(guard: Any) -> dict[str, Any]:
@@ -272,8 +246,7 @@ def build_overview(guard: Any) -> dict[str, Any]:
     settings = guard.settings
     metrics = guard.metrics
     guardian = guard.guardian
-    overview = metrics.overview(window_s=settings.stats_window_seconds)
-    supervisors = "running" if guardian.supervisor_running else "stopped"
+    overview = metrics.overview(window_s=900)
     marks = guardian.all_marks()
     return {
         "enabled": settings.enable,
@@ -281,15 +254,12 @@ def build_overview(guard: Any) -> dict[str, Any]:
         "config": settings.to_public_dict(),
         "runtime": {
             "wrapped": guard.wrapped_count,
-            "supervisor": supervisors,
+            "supervisor": "running" if guardian.supervisor_running else "stopped",
             "marked": len(marks),
-            "pending_confirm": sum(
-                1 for view in marks.values() if view.state is MarkState.CONFIRMING
-            ),
+            "pending_confirm": 0,
+            # 反映真实配置值：页面据此决定是否显示「测活 / 标记 / 解除标记」按钮。
             "allow_actions": bool(settings.allow_webui_actions),
             "provider_manager": guard.provider_manager is not None,
-            "mark_scope": settings.mark_scope,
-            "mark_scope_is_profile": settings.mark_scope == MARK_SCOPE_PROFILE,
             "internal_errors": metrics.counters.get("guard_internal_errors", 0),
             "framework_fallback_hops": metrics.counters.get("framework_fallback_hops", 0),
             "all_candidates_marked": metrics.counters.get("all_candidates_marked", 0),
@@ -302,48 +272,17 @@ def build_overview(guard: Any) -> dict[str, Any]:
             "counters": overview.get("counters") or {},
         },
         "providers": collect_providers(guard),
-        "marks": [
-            dict(view.to_dict(), scope_key=key) for key, view in marks.items()
-        ],
-        "routes": collect_routes(guard),
+        "marks": [dict(view.to_dict()) for view in marks.values()],
+        "chains": collect_chains(guard),
     }
 
 
-def build_routes(guard: Any, *, profile_id: str | None = None) -> dict[str, Any]:
-    """``GET /routes`` 的 ``data``。"""
-    routes = collect_routes(guard)
+def build_chains(guard: Any, *, profile_id: str | None = None) -> dict[str, Any]:
+    """``GET /chains`` 的 ``data``。"""
+    chains = collect_chains(guard)
     if profile_id:
-        routes = [item for item in routes if item.get("profile_id") == profile_id]
-    return {"profiles": collect_profiles(guard), "routes": routes}
-
-
-def build_profiles(guard: Any) -> dict[str, Any]:
-    """``GET /profiles`` 的 ``data``。
-
-    返回框架的配置文件列表（id / name / path / 默认模型），以及**没能解析**
-    的路由引用（``unmatched``），让页面能明确提示「这条路由没接管任何配置文件」。
-    """
-    profiles = collect_profiles(guard)
-    entries = [
-        {"id": item["id"], "name": item["name"], "path": item["path"]}
-        for item in profiles
-    ]
-    unmatched: list[str] = []
-    for route in guard.settings.profiles:
-        ref = route.profile_ref
-        if not ref:
-            continue
-        result = resolve_profile_ref(ref, entries)
-        if not result.ok:
-            unmatched.append(ref)
-    for ref in sorted(guard.settings.disabled_profiles):
-        result = resolve_profile_ref(ref, entries)
-        if not result.ok:
-            unmatched.append(ref)
-    return {
-        "profiles": profiles,
-        "unmatched": sorted(set(unmatched)),
-    }
+        chains = [item for item in chains if item.get("profile_id") == profile_id]
+    return {"profiles": chains, "chains": chains}
 
 
 def build_events(
@@ -371,22 +310,6 @@ def build_events(
     }
 
 
-def build_health(guard: Any) -> dict[str, Any]:
-    """``GET /health`` 的 ``data``。"""
-    metrics = guard.metrics
-    guardian = guard.guardian
-    return {
-        "wrapped": guard.wrapped_count,
-        "supervisor": "running" if guardian.supervisor_running else "stopped",
-        "internal_errors": metrics.counters.get("guard_internal_errors", 0),
-        "provider_manager": guard.provider_manager is not None,
-        "enabled": guard.settings.enable,
-        "allow_actions": bool(guard.settings.allow_webui_actions),
-        "state_file": str(getattr(guard, "state_path", "") or ""),
-        "last_load_error": getattr(guard, "state_load_error", None),
-    }
-
-
 async def perform_action(
     guard: Any,
     action: str,
@@ -404,7 +327,7 @@ async def perform_action(
     if name in WRITE_ACTIONS and not settings.allow_webui_actions:
         return envelope_error(
             "页面写操作已在插件配置中禁用（allow_webui_actions=false），"
-            "请改用管理员命令 /llmguard，或在插件配置里开启该开关。"
+            "请改用管理员命令 /llmguard。"
         )
 
     if name in ("mark",):
@@ -422,7 +345,6 @@ async def perform_action(
             ttl=ttl,
             source="manual",
             detail="通过 Web 页面手动标记",
-            profile_hint="",
         )
         return envelope_ok({"provider_id": provider_id, "marked": bool(marked)})
 
@@ -466,15 +388,12 @@ def parse_limit(value: Any, default: int = 50) -> int:
     return max(1, min(requested, MAX_EVENTS_LIMIT))
 
 
-def route_handlers() -> Sequence[tuple[str, str]]:
+def route_handlers() -> tuple[tuple[str, str], ...]:
     """返回 ``(route, method)`` 清单，便于 main.py 注册与自检。"""
     return (
         (ROUTE_OVERVIEW, "GET"),
-        (ROUTE_ROUTES, "GET"),
+        (ROUTE_CHAINS, "GET"),
         (ROUTE_EVENTS, "GET"),
-        (ROUTE_HEALTH, "GET"),
-        (ROUTE_PROFILES, "GET"),
-        (ROUTE_SCHEMA_REFRESH, "GET"),
         (ROUTE_MARK, "POST"),
         (ROUTE_UNMARK, "POST"),
         (ROUTE_PROBE, "POST"),

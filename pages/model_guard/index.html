@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>LLM 模型守护 · 监控</title>
+<title>LLM 模型守护 · 链路监控</title>
 <link rel="stylesheet" href="./style.css">
 </head>
 <body>
@@ -14,7 +14,7 @@
       <h1>LLM 模型守护</h1>
       <span class="lm-badge lm-badge--mute" id="lmEnableBadge">状态未知</span>
       <p class="lm-sub" id="lmConfigSummary">
-        <span>测活间隔 —</span><span>测活超时 —</span><span>二次确认 —</span><span>上次刷新 —</span>
+        <span>请求超时 —</span><span>最大重试 —</span><span>验证间隔 —</span><span>上次刷新 —</span>
       </p>
     </div>
     <div class="lm-toolbar">
@@ -39,12 +39,7 @@
 
   <section class="lm-cards" id="lmCards" aria-label="总览">
     <div class="lm-card">
-      <div class="lm-card-label">调用总数</div>
-      <div class="lm-card-value">—</div>
-      <div class="lm-card-note">等待数据</div>
-    </div>
-    <div class="lm-card">
-      <div class="lm-card-label">错误总数</div>
+      <div class="lm-card-label">插件状态</div>
       <div class="lm-card-value">—</div>
       <div class="lm-card-note">等待数据</div>
     </div>
@@ -54,33 +49,21 @@
       <div class="lm-card-note">等待数据</div>
     </div>
     <div class="lm-card">
-      <div class="lm-card-label">已标记模型</div>
+      <div class="lm-card-label">被标记模型</div>
       <div class="lm-card-value">—</div>
       <div class="lm-card-note">等待数据</div>
     </div>
   </section>
 
-  <section class="lm-panel" id="lmProfilesPanel" aria-labelledby="lmProfilesTitle">
+  <section class="lm-panel" id="lmChainsPanel" aria-labelledby="lmChainsTitle">
     <div class="lm-panel-head">
-      <h2 id="lmProfilesTitle">配置文件 <span class="lm-count" id="lmProfilesCount">—</span></h2>
+      <h2 id="lmChainsTitle">链路视图 <span class="lm-count" id="lmChainsCount">—</span></h2>
       <div class="lm-panel-tools">
-        <span class="lm-hint" id="lmProfilesHint"></span>
+        <span class="lm-hint" id="lmChainsHint">请求会按下面每一行的顺序依次尝试</span>
       </div>
     </div>
-    <div class="lm-panel-body" id="lmProfilesWrap">
-      <div class="lm-empty">正在加载配置文件列表…</div>
-    </div>
-  </section>
-
-  <section class="lm-panel" aria-labelledby="lmRoutesTitle">
-    <div class="lm-panel-head">
-      <h2 id="lmRoutesTitle">模型路由 <span class="lm-count" id="lmRoutesCount">—</span></h2>
-      <div class="lm-panel-tools">
-        <span class="lm-hint" id="lmRoutesHint"></span>
-      </div>
-    </div>
-    <div class="lm-panel-body" id="lmRoutesWrap">
-      <div class="lm-empty">正在连接 AstrBot 页面桥接…</div>
+    <div class="lm-panel-body" id="lmChainsWrap">
+      <div class="lm-empty">正在加载链路信息…</div>
     </div>
   </section>
 
@@ -98,18 +81,6 @@
       <div id="lmProvidersWrap">
         <div class="lm-empty">正在连接 AstrBot 页面桥接…</div>
       </div>
-    </div>
-  </section>
-
-  <section class="lm-panel" aria-labelledby="lmMarksTitle">
-    <div class="lm-panel-head">
-      <h2 id="lmMarksTitle">标记详情 <span class="lm-count" id="lmMarksCount">—</span></h2>
-      <div class="lm-panel-tools">
-        <span class="lm-hint" id="lmMarksHint"></span>
-      </div>
-    </div>
-    <div class="lm-panel-body" id="lmMarksWrap">
-      <div class="lm-empty">正在连接 AstrBot 页面桥接…</div>
     </div>
   </section>
 
@@ -140,10 +111,6 @@
       <div class="lm-form-row">
         <label for="lmMarkReason">标记原因（可选，便于回溯）</label>
         <input type="text" class="lm-input" id="lmMarkReason" maxlength="200" placeholder="例如：手动排查，key 疑似失效">
-      </div>
-      <div class="lm-form-row">
-        <label for="lmMarkTtl">标记时长秒数（可选，留空表示使用默认/不自动解除）</label>
-        <input type="number" class="lm-input" id="lmMarkTtl" min="1" step="1" placeholder="例如 600">
       </div>
     </div>
     <div class="lm-modal-actions">

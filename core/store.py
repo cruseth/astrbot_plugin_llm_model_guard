@@ -20,7 +20,9 @@ from typing import Any, Callable, Mapping
 from .models import LOG_PREFIX, PLUGIN_NAME
 
 #: 当前状态文件版本号。
-SCHEMA_VERSION = 1
+#:
+#: v2（v0.2.0）：删除 ``marks_by_profile``（标记统一按 provider 全局）。
+SCHEMA_VERSION = 2
 
 #: 单文件体积上限（规划文档 §8.3）。
 MAX_STATE_BYTES = 4 * 1024 * 1024
@@ -28,14 +30,13 @@ MAX_STATE_BYTES = 4 * 1024 * 1024
 STATE_FILE_NAME = "state.json"
 
 
-def empty_state(*, plugin_version: str = "0.1.0") -> dict[str, Any]:
+def empty_state(*, plugin_version: str = "0.2.0") -> dict[str, Any]:
     """空状态骨架；所有读取路径都以它为底。"""
     return {
         "schema_version": SCHEMA_VERSION,
         "plugin_version": plugin_version,
         "saved_at": 0.0,
         "marks": {},
-        "marks_by_profile": {},
         "providers": {},
         "recent_events": [],
         "probes": {},
@@ -139,7 +140,6 @@ class StateStore:
         state["schema_version"] = SCHEMA_VERSION
         for key, default in (
             ("marks", {}),
-            ("marks_by_profile", {}),
             ("providers", {}),
             ("probes", {}),
             ("runtime", {}),
@@ -336,8 +336,48 @@ def _migrate_v0_to_v1(raw: Mapping[str, Any]) -> dict[str, Any]:
     return migrated
 
 
+def _migrate_v1_to_v2(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """v1（v0.1.x）→ v2（v0.2.0）。
+
+    v0.2.0 把标记统一为**按 provider 全局**，因此：
+
+    * **丢弃** ``marks_by_profile``（profile 维度的标记不再存在）；
+    * **保留**全局 ``marks``；
+    * 丢弃 v1 的 TTL 字段（``expires_at``）与双击确认态 —— v2 的恢复判据是
+      「连续成功 N 次」。
+    """
+    migrated = dict(raw)
+    migrated["schema_version"] = 2
+    migrated.pop("marks_by_profile", None)
+
+    marks = migrated.get("marks")
+    if isinstance(marks, Mapping):
+        cleaned: dict[str, Any] = {}
+        for provider_id, block in marks.items():
+            if not isinstance(block, Mapping):
+                continue
+            item = dict(block)
+            # TTL 与双击确认态在 v2 里没有意义。
+            item.pop("expires_at", None)
+            item.pop("first_success_at", None)
+            item.pop("profile_hint", None)
+            # v2 用连续成功计数表达恢复进度；v1 的确认进度归零重新累计。
+            item["consecutive_success"] = 0
+            if item.get("state") != "marked":
+                item["state"] = "marked"
+            cleaned[str(provider_id)] = item
+        migrated["marks"] = cleaned
+
+    migrated.setdefault("providers", {})
+    migrated.setdefault("recent_events", [])
+    migrated.setdefault("probes", {})
+    migrated.setdefault("runtime", {})
+    return migrated
+
+
 _MIGRATIONS: dict[int, Callable[[Mapping[str, Any]], dict[str, Any]]] = {
     0: _migrate_v0_to_v1,
+    1: _migrate_v1_to_v2,
 }
 
 

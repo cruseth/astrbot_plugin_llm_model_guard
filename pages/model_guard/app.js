@@ -1,10 +1,11 @@
-/* LLM 模型守护 · 插件页面脚本
+/* LLM 模型守护 · 插件页面脚本（v0.2.0 链路视图）
  *
  * 免构建：原生 ES 模块，无外部依赖、无 CDN、无框架。
  * 数据通过 AstrBot 注入的 window.AstrBotPluginPage 桥接获取：
  *   apiGet(endpoint, params) / apiPost(endpoint, body)
  * 桥接内部会把 endpoint 拼成 /api/plug/<插件名>/<endpoint>，因此这里只传
- * 相对端点名（overview / events / probe / mark / unmark / reload）。
+ * 相对端点名（overview / chains / events / probe / mark / unmark / reload）。
+ * 已删除的端点（/profiles、/schema_refresh）不再调用。
  * 桥接只把响应信封里的 data 交给页面，status="error" 会被 reject 成 Error。
  *
  * 安全约定：所有后端返回的文本一律走 textContent，不使用 innerHTML。
@@ -28,9 +29,9 @@ const pageState = {
   events: undefined,
   eventsUnsupported: false,
   eventProviderFilter: "",
-  profiles: undefined,
-  profilesUnsupported: false,
-  profilesError: "",
+  chains: undefined,
+  chainsUnsupported: false,
+  chainsError: "",
   autoRefresh: true,
   intervalMs: DEFAULT_INTERVAL_MS,
   timerId: null,
@@ -153,6 +154,12 @@ function fmtSeconds(value) {
   return parsed === null ? "—" : `${Math.round(parsed)} 秒`;
 }
 
+/** 带单位的整数展示，例如「2 次」。 */
+function fmtCount(value, unit) {
+  const parsed = asNumber(value);
+  return parsed === null ? "—" : `${Math.round(parsed)} ${unit}`;
+}
+
 function fmtPercent(ratio) {
   const parsed = asNumber(ratio);
   if (parsed === null) return "—";
@@ -242,9 +249,10 @@ function unwrapEnvelope(payload) {
     typeof payload.data === "object"
   ) {
     const inner = payload.data;
+    // chains 端点的 data 就是 {profiles:[...]}，所以 profiles 也在识别列表里。
     const looksLikeData =
       inner.providers !== undefined ||
-      inner.routes !== undefined ||
+      inner.chains !== undefined ||
       inner.profiles !== undefined ||
       inner.marks !== undefined ||
       inner.events !== undefined ||
@@ -288,12 +296,20 @@ function isRouteMissing(error) {
 /* ---------- 数据归一化 ---------- */
 
 const MARK_STATE_LABELS = {
+  healthy: { text: "健康", tone: "ok" },
   marked: { text: "已标记", tone: "danger" },
-  confirming: { text: "待二次确认", tone: "warn" },
-  degraded: { text: "降级使用", tone: "warn" },
-  probing: { text: "测活中", tone: "warn" },
-  normal: { text: "正常", tone: "ok" },
+  confirming: { text: "待验证", tone: "warn" },
+  probing: { text: "验证中", tone: "warn" },
+  normal: { text: "健康", tone: "ok" },
+  ok: { text: "健康", tone: "ok" },
 };
+
+/** marked_state 里表示「正常」的取值；其余非空值都按被标记处理。 */
+const HEALTHY_MARK_STATES = new Set(["healthy", "ok", "normal", "none"]);
+
+function isMarkedStateValue(state) {
+  return Boolean(state) && !HEALTHY_MARK_STATES.has(state);
+}
 
 function readMarkState(...sources) {
   for (const source of sources) {
@@ -343,20 +359,6 @@ function normalizeMarks(rawMarks) {
   return list;
 }
 
-function markDetailOf(mark) {
-  const category = pick(mark, ["category", "error_class", "reason", "error.type", "class"]);
-  const detail = pick(mark, ["detail", "message", "error_message", "last_error.message"]);
-  const reasonValue = pick(mark, ["reason"]);
-  let reason = detail ? String(detail) : "";
-  if (!reason && reasonValue !== undefined && String(reasonValue) !== String(category)) {
-    reason = String(reasonValue);
-  }
-  return {
-    category: category === undefined ? "" : String(category),
-    reason,
-  };
-}
-
 function normalizeProviders(rawProviders, marksById) {
   const list = [];
   const push = (entry, fallbackId) => {
@@ -366,8 +368,14 @@ function normalizeProviders(rawProviders, marksById) {
     const markEntry = marksById.get(id) || null;
     const rawMarkState = readMarkState(entry.marked_state, markEntry);
     const markedFlag = asBool(pick(entry, ["marked"]));
-    const marked = rawMarkState !== "" || markedFlag === true || Boolean(markEntry);
-    const state = rawMarkState || (markedFlag === true ? "marked" : "normal");
+    // marked_state 可能是 "marked" 或 "healthy"：只有非健康值才算被标记。
+    const marked =
+      isMarkedStateValue(rawMarkState) || markedFlag === true || Boolean(markEntry);
+    const state = marked
+      ? rawMarkState && isMarkedStateValue(rawMarkState)
+        ? rawMarkState
+        : "marked"
+      : "healthy";
     const calls = asNumber(
       pick(entry, ["calls", "stats.calls", "stats.total", "total_calls"]),
     );
@@ -405,6 +413,27 @@ function normalizeProviders(rawProviders, marksById) {
       "last_error_message",
       "last_error",
     ]);
+    // 最近错误类别：优先 last_error.class；v0.2.0 只给 error_classes 计数，
+    // 这时取出现次数最多的类别，退而使用标记原因。
+    const errorClasses =
+      entry.error_classes && typeof entry.error_classes === "object" ? entry.error_classes : null;
+    let errorClassText = errorClass === undefined ? "" : String(errorClass);
+    if (!errorClassText && errorClasses) {
+      let bestClass = "";
+      let bestCount = -1;
+      for (const name of Object.keys(errorClasses)) {
+        const count = asNumber(errorClasses[name]);
+        const numeric = count === null ? 0 : count;
+        if (numeric > bestCount) {
+          bestCount = numeric;
+          bestClass = name;
+        }
+      }
+      errorClassText = bestClass;
+    }
+    if (!errorClassText) {
+      errorClassText = String(pick(entry, ["marked_reason", "reason"]) || "");
+    }
     list.push({
       id,
       model:
@@ -416,7 +445,8 @@ function normalizeProviders(rawProviders, marksById) {
       successRate,
       latencyAvg,
       latencyP95,
-      errorClass: errorClass === undefined ? "" : String(errorClass),
+      errorClass: errorClassText,
+      errorClasses: errorClasses || {},
       errorMessage:
         typeof errorMessage === "string"
           ? errorMessage
@@ -424,6 +454,17 @@ function normalizeProviders(rawProviders, marksById) {
             ? String(pick(errorMessage, ["message", "detail"]) || "")
             : "",
       consecutiveErrors: asNumber(pick(entry, ["consecutive_errors", "stats.consecutive_errors"])),
+      // 连续验证成功次数可能在 provider.probe 里，也可能只在标记记录里。
+      consecutiveSuccess:
+        asNumber(
+          pick(entry, [
+            "probe.consecutive_success",
+            "consecutive_success",
+            "stats.consecutive_success",
+            "probe_success_count",
+          ]),
+        ) ?? asNumber(pick(markEntry || {}, ["consecutive_success"])),
+      probeOk: asBool(pick(entry, ["probe.last_ok", "probe.ok"])),
       marked,
       state,
       mark: markEntry,
@@ -439,63 +480,60 @@ function normalizeProviders(rawProviders, marksById) {
   return list;
 }
 
-function normalizeRoutes(rawRoutes) {
-  const list = [];
-  const push = (entry, fallbackId) => {
-    if (!entry || typeof entry !== "object") return;
-    const fallbacks = Array.isArray(pick(entry, ["fallbacks", "fallback", "fallback_chain"]))
-      ? pick(entry, ["fallbacks", "fallback", "fallback_chain"]).map(String)
-      : [];
-    const chain = Array.isArray(pick(entry, ["effective_chain", "chain", "candidates"]))
-      ? pick(entry, ["effective_chain", "chain", "candidates"]).map(String)
-      : [];
-    const marked = Array.isArray(pick(entry, ["marked", "marked_ids"]))
-      ? pick(entry, ["marked", "marked_ids"]).map(String)
-      : [];
-    const bypassed = Array.isArray(pick(entry, ["bypassed", "skipped"]))
-      ? pick(entry, ["bypassed", "skipped"]).map(String)
-      : [];
-    const missing = Array.isArray(pick(entry, ["missing", "missing_ids"]))
-      ? pick(entry, ["missing", "missing_ids"]).map(String)
-      : [];
-    const warnings = Array.isArray(entry.warnings)
-      ? entry.warnings
-          .map((item) =>
-            typeof item === "string" ? item : String(pick(item || {}, ["message", "code"]) || ""),
-          )
-          .filter(Boolean)
-      : [];
-    const profileId = String(
-      pick(entry, ["profile_id", "id", "profile", "conf_id"]) || fallbackId || "",
-    );
-    const profileName = String(pick(entry, ["profile_name", "name", "conf_name"]) || "");
-    // profile_display 由后端给出「名称 (id)」；取不到时本地等价拼一次，再退回 id。
-    const profileDisplay =
-      String(pick(entry, ["profile_display", "display"]) || "") ||
-      (profileName && profileId ? `${profileName} (${profileId})` : profileName || profileId);
-    list.push({
-      profileId,
-      profileName,
-      profileDisplay,
-      primary: String(pick(entry, ["primary", "primary_model", "main", "main_model"]) || ""),
-      fallbacks,
-      chain,
-      marked,
-      bypassed,
-      missing,
-      warnings,
-      source: String(pick(entry, ["source", "origin"]) || ""),
-      degradedUse: String(pick(entry, ["degraded_use", "degraded"]) || ""),
-      unmatched: asNumber(pick(entry, ["unmatched"])),
-    });
-  };
+function toStringList(value) {
+  return Array.isArray(value) ? value.map(String).filter(Boolean) : [];
+}
 
-  if (Array.isArray(rawRoutes)) {
-    rawRoutes.forEach((entry) => push(entry, null));
-  } else if (rawRoutes && typeof rawRoutes === "object") {
-    Object.keys(rawRoutes).forEach((key) => push(rawRoutes[key], key));
+/**
+ * GET /chains 的 data：{profiles:[{...}]}。
+ * 每项：id/profile_id、name、path、is_default、current_provider/default_provider、
+ * fallbacks、chain、bypassed/marked、missing。
+ * 注意：后端实现的 chain 已剔除被跳过的模型，为了能在流水线里标出「已标记」，
+ * 这里按框架顺序（当前模型 + 回退列表）重建展示顺序，再并入后端给的 chain 与 marked。
+ */
+function normalizeChains(raw) {
+  const source = unwrapEnvelope(raw);
+  let list = [];
+  if (Array.isArray(source)) {
+    list = source;
+  } else if (source && typeof source === "object") {
+    if (Array.isArray(source.profiles)) list = source.profiles;
+    else if (Array.isArray(source.chains)) list = source.chains;
+    else if (Array.isArray(source.items)) list = source.items;
   }
-  return list;
+
+  return list
+    .filter((item) => item && typeof item === "object")
+    .map((item) => {
+      const currentProvider = String(
+        pick(item, ["current_provider", "default_provider", "current", "primary", "main"]) || "",
+      );
+      const fallbacks = toStringList(
+        pick(item, ["fallbacks", "fallback", "fallback_chain"]),
+      );
+      const backendChain = toStringList(pick(item, ["chain", "effective_chain", "candidates"]));
+      const bypassed = toStringList(pick(item, ["bypassed", "marked", "skipped", "marked_ids"]));
+
+      // 展示用的顺序：框架展开顺序优先，再补后端 chain 里多出来的项，
+      // 最后补上后端单独标记但不在上述两个列表里的 id。
+      const orderedChain = [];
+      for (const providerId of [currentProvider, ...fallbacks, ...backendChain, ...bypassed]) {
+        if (providerId && !orderedChain.includes(providerId)) orderedChain.push(providerId);
+      }
+      const chain = orderedChain;
+      return {
+        id: String(pick(item, ["id", "profile_id", "conf_id"]) || ""),
+        name: String(pick(item, ["name", "profile_name", "conf_name"]) || ""),
+        path: String(pick(item, ["path", "file", "config_path"]) || ""),
+        isDefault: asBool(pick(item, ["is_default", "default"])) === true,
+        currentProvider,
+        fallbacks,
+        chain,
+        bypassed,
+        missing: toStringList(pick(item, ["missing", "missing_ids"])),
+      };
+    })
+    .filter((item) => item.id || item.name || item.chain.length);
 }
 
 function normalizeOverview(raw) {
@@ -511,7 +549,6 @@ function normalizeOverview(raw) {
     source.providers !== undefined ? source.providers : pick(source, ["metrics.providers"]),
     marksById,
   );
-  const routes = normalizeRoutes(source.routes);
   const runtime =
     source.runtime && typeof source.runtime === "object" ? source.runtime : {};
   const stats = source.stats && typeof source.stats === "object" ? source.stats : {};
@@ -576,7 +613,6 @@ function normalizeOverview(raw) {
     allowActions: allowActions === true,
     providers,
     marks,
-    routes,
     stats: {
       totalCalls,
       totalErrors,
@@ -587,16 +623,26 @@ function normalizeOverview(raw) {
     runtime,
     counters,
     config: {
-      probeInterval: asNumber(pick(config, ["probe_interval", "probe_interval_seconds"])),
-      probeTimeout: asNumber(pick(config, ["probe_timeout", "probe_timeout_seconds"])),
-      doubleConfirm: asBool(pick(config, ["require_double_confirm", "double_confirm"])),
-      confirmDelay: asNumber(
-        pick(config, ["confirm_interval", "confirm_delay", "confirm_delay_seconds"]),
+      // v0.2.0：8 个全局键，配置里不再有 provider id / 配置文件 id。
+      requestTimeout: asNumber(
+        pick(config, ["request_timeout_seconds", "request_timeout", "timeout_seconds"]),
+      ),
+      maxRetries: asNumber(pick(config, ["max_retries", "retries"])),
+      retryBackoff: asNumber(
+        pick(config, ["retry_backoff_seconds", "retry_backoff", "backoff_seconds"]),
+      ),
+      retryCategories: toStringList(
+        pick(config, ["retry_categories", "retry_category", "categories"]),
+      ),
+      probeInterval: asNumber(pick(config, ["probe_interval_seconds", "probe_interval"])),
+      probeTimeout: asNumber(pick(config, ["probe_timeout_seconds", "probe_timeout"])),
+      probeSuccessThreshold: asNumber(
+        pick(config, ["probe_success_threshold", "success_threshold", "probe_threshold"]),
       ),
       raw: config,
     },
+    chains: normalizeChains(pick(source, ["chains"])),
     wrappedCount: asNumber(pick(runtime, ["wrapped", "wrapped_count"])),
-    pendingConfirm: asNumber(pick(runtime, ["pending_confirm"])),
     providerManager: asBool(pick(runtime, ["provider_manager"])),
     supervisor,
     internalErrors,
@@ -619,56 +665,6 @@ function normalizeEvents(raw) {
   return list.filter((item) => item && typeof item === "object");
 }
 
-/**
- * GET /profiles 的 data：{profiles:[{id,name,path,is_default,default_provider,
- * default_provider_exists}], unmatched:[]}。
- * 同时兼容 profile_id / default_provider_id 等别名写法。
- */
-function normalizeProfiles(raw) {
-  const source = unwrapEnvelope(raw);
-  let list = [];
-  if (Array.isArray(source)) {
-    list = source;
-  } else if (source && typeof source === "object") {
-    if (Array.isArray(source.profiles)) list = source.profiles;
-    else if (Array.isArray(source.items)) list = source.items;
-    else if (Array.isArray(source.conf_list)) list = source.conf_list;
-  }
-
-  const profiles = list
-    .filter((item) => item && typeof item === "object")
-    .map((item) => {
-      const id = String(pick(item, ["id", "profile_id", "conf_id"]) || "");
-      return {
-        id,
-        name: String(pick(item, ["name", "profile_name", "conf_name", "display_name"]) || ""),
-        path: String(pick(item, ["path", "file", "file_name", "config_path"]) || ""),
-        isDefault: asBool(pick(item, ["is_default", "default"])) === true,
-        defaultProvider: String(
-          pick(item, ["default_provider", "default_provider_id", "provider", "provider_id"]) || "",
-        ),
-        defaultProviderExists: asBool(
-          pick(item, ["default_provider_exists", "provider_exists"]),
-        ),
-      };
-    })
-    .filter((item) => item.id || item.name);
-
-  const rawUnmatched =
-    source && typeof source === "object" && Array.isArray(source.unmatched)
-      ? source.unmatched
-      : [];
-  const unmatched = rawUnmatched
-    .map((item) =>
-      typeof item === "string"
-        ? item
-        : String(pick(item || {}, ["profile_id", "id", "profile", "profile_display"]) || ""),
-    )
-    .filter(Boolean);
-
-  return { profiles, unmatched };
-}
-
 /* ---------- 渲染：顶栏与卡片 ---------- */
 
 function renderSummary(data) {
@@ -689,17 +685,13 @@ function renderSummary(data) {
   const summary = ui.configSummary;
   if (!summary) return;
   clearNode(summary);
+  const config = data ? data.config : {};
   const items = [
-    `测活间隔 ${fmtSeconds(data ? data.config.probeInterval : null)}`,
-    `测活超时 ${fmtSeconds(data ? data.config.probeTimeout : null)}`,
+    `请求超时 ${fmtSeconds(config.requestTimeout)}`,
+    `最大重试 ${fmtCount(config.maxRetries, "次")}`,
+    `验证间隔 ${fmtSeconds(config.probeInterval)}`,
+    `连续成功阈值 ${fmtCount(config.probeSuccessThreshold, "次")}`,
   ];
-  const doubleConfirm = data ? data.config.doubleConfirm : undefined;
-  items.push(
-    `二次确认 ${doubleConfirm === undefined ? "—" : doubleConfirm ? "开启" : "关闭"}`,
-  );
-  if (data && data.config.confirmDelay !== null && data.config.confirmDelay !== undefined) {
-    items.push(`确认间隔 ${fmtSeconds(data.config.confirmDelay)}`);
-  }
   items.push(`上次刷新 ${pageState.lastLoadedAt ? fmtClock(pageState.lastLoadedAt) : "—"}`);
   for (const text of items) {
     summary.appendChild(el("span", null, text));
@@ -720,11 +712,11 @@ function renderCards(data) {
   if (!ui.cards) return;
   clearNode(ui.cards);
   if (!data) {
-    ui.cards.appendChild(buildCard("调用总数", "—", "尚未获取到数据"));
+    ui.cards.appendChild(buildCard("插件状态", "—", "尚未获取到数据"));
     return;
   }
   const stats = data.stats;
-  const errorTone = stats.totalErrors > 0 ? "danger" : undefined;
+  const config = data.config;
   const rateTone =
     stats.successRate === null
       ? undefined
@@ -733,297 +725,203 @@ function renderCards(data) {
         : stats.successRate >= 0.9
           ? "warn"
           : "danger";
+
   ui.cards.appendChild(
     buildCard(
-      "调用总数",
-      fmtInt(stats.totalCalls),
-      `覆盖 ${data.providers.length} 个模型${
-        stats.windowSeconds ? `，统计窗口 ${fmtSeconds(stats.windowSeconds)}` : ""
-      }`,
+      "插件状态",
+      data.enabled === true ? "已启用" : data.enabled === false ? "已禁用" : "未知",
+      data.enabled === false ? "插件当前不接管模型，本页为历史数据" : "正在守护模型调用",
+      data.enabled === false ? "danger" : data.enabled === true ? "ok" : undefined,
     ),
   );
   ui.cards.appendChild(
-    buildCard("错误总数", fmtInt(stats.totalErrors), "含超时与鉴权失败", errorTone),
-  );
-  ui.cards.appendChild(
-    buildCard("成功率", fmtPercent(stats.successRate), "基于累计调用统计", rateTone),
+    buildCard(
+      "成功率",
+      fmtPercent(stats.successRate),
+      `共 ${fmtInt(stats.totalCalls)} 次调用${
+        stats.totalErrors ? ` · ${fmtInt(stats.totalErrors)} 次失败` : ""
+      }`,
+      rateTone,
+    ),
   );
   ui.cards.appendChild(
     buildCard(
-      "已标记模型",
+      "被标记模型",
       fmtInt(stats.markedCount),
-      stats.markedCount > 0
-        ? data.pendingConfirm > 0
-          ? `其中 ${fmtInt(data.pendingConfirm)} 个待二次确认`
-          : "被标记的模型会被跳过"
-        : "没有模型被标记",
+      stats.markedCount > 0 ? "被标记的模型会在链路中被跳过" : "当前没有被标记的模型",
       stats.markedCount > 0 ? "warn" : undefined,
     ),
   );
-  if (data.wrappedCount !== null || data.supervisor) {
-    ui.cards.appendChild(
-      buildCard(
-        "已纳管模型",
-        data.wrappedCount === null ? "—" : fmtInt(data.wrappedCount),
-        data.supervisor ? `测活巡检：${data.supervisor}` : "测活巡检状态未知",
-      ),
-    );
-  }
+  ui.cards.appendChild(
+    buildCard(
+      "请求超时",
+      fmtSeconds(config.requestTimeout),
+      config.retryBackoff === null
+        ? "超出后按错误类别决定是否重试"
+        : `重试退避 ${fmtSeconds(config.retryBackoff)}`,
+    ),
+  );
+  ui.cards.appendChild(
+    buildCard(
+      "最大重试",
+      fmtCount(config.maxRetries, "次"),
+      config.retryCategories.length
+        ? `重试类别：${config.retryCategories.join("、")}`
+        : "仅对可重试的错误类别生效",
+    ),
+  );
+  ui.cards.appendChild(
+    buildCard(
+      "验证间隔",
+      fmtSeconds(config.probeInterval),
+      config.probeTimeout === null
+        ? "对已标记模型定期验证"
+        : `单次验证超时 ${fmtSeconds(config.probeTimeout)}`,
+    ),
+  );
+  ui.cards.appendChild(
+    buildCard(
+      "连续成功阈值",
+      fmtCount(config.probeSuccessThreshold, "次"),
+      "验证连续成功达到该次数后自动解除标记",
+    ),
+  );
 }
 
-/* ---------- 渲染：配置文件 ---------- */
+/* ---------- 渲染：链路视图（核心） ---------- */
 
-function profileStatusBadge(profile) {
-  if (!profile.defaultProvider) {
-    return el("span", "lm-badge lm-badge--mute", "未设置默认模型");
+/** 流水线里的一步：provider id（等宽字体）；被标记的加删除线与「已标记」标签。 */
+function chainStep(providerId, bypassedSet) {
+  const marked = bypassedSet.has(providerId);
+  const step = el(
+    "span",
+    marked ? "lm-pipeline-step lm-pipeline-step--marked" : "lm-pipeline-step",
+  );
+  step.appendChild(el("span", "lm-pipeline-id lm-mono", providerId));
+  if (marked) {
+    step.appendChild(el("span", "lm-badge lm-badge--danger", "已标记"));
   }
-  if (profile.defaultProviderExists === false) {
-    return el("span", "lm-badge lm-badge--warn", "默认模型缺失");
-  }
-  return el("span", "lm-badge lm-badge--ok", "正常");
+  return step;
 }
 
-function renderProfiles() {
-  const wrap = ui.profilesWrap;
+function renderChains() {
+  const wrap = ui.chainsWrap;
   if (!wrap) return;
   clearNode(wrap);
 
-  const state = pageState.profiles;
+  const state = pageState.chains;
 
-  if (pageState.profilesUnsupported) {
-    if (ui.profilesCount) ui.profilesCount.textContent = "—";
-    if (ui.profilesHint) ui.profilesHint.textContent = "";
+  if (pageState.chainsUnsupported) {
+    if (ui.chainsCount) ui.chainsCount.textContent = "—";
+    if (ui.chainsHint) ui.chainsHint.textContent = "";
     const empty = el("div", "lm-empty");
-    empty.appendChild(el("strong", null, "当前后端未提供配置文件列表"));
+    empty.appendChild(el("strong", null, "当前后端未提供链路信息"));
     empty.appendChild(
-      el(
-        "span",
-        null,
-        "后端尚未注册 /profiles 接口；路由表会回退显示配置文件 id。升级插件后刷新本页即可看到配置文件名称。",
-      ),
+      el("span", null, "后端尚未注册 /chains 接口；升级插件后刷新本页即可看到链路。"),
     );
     wrap.appendChild(empty);
     return;
   }
 
   if (state === undefined) {
-    if (ui.profilesCount) ui.profilesCount.textContent = "—";
-    if (ui.profilesHint) ui.profilesHint.textContent = "";
-    wrap.appendChild(el("div", "lm-empty", "正在加载配置文件列表…"));
+    if (ui.chainsCount) ui.chainsCount.textContent = "—";
+    if (ui.chainsHint) ui.chainsHint.textContent = "";
+    wrap.appendChild(el("div", "lm-empty", "正在加载链路信息…"));
     return;
   }
 
   if (state === null) {
-    if (ui.profilesCount) ui.profilesCount.textContent = "—";
-    if (ui.profilesHint) ui.profilesHint.textContent = "";
+    if (ui.chainsCount) ui.chainsCount.textContent = "—";
+    if (ui.chainsHint) ui.chainsHint.textContent = "";
     const box = el("div", "lm-inline-notice lm-inline-notice--error");
-    box.appendChild(el("strong", null, "配置文件列表加载失败："));
-    box.appendChild(el("span", null, pageState.profilesError || "未知错误"));
+    box.appendChild(el("strong", null, "链路信息加载失败："));
+    box.appendChild(el("span", null, pageState.chainsError || "未知错误"));
     wrap.appendChild(box);
     const retryRow = el("div", "lm-retry-row");
     const retry = el("button", "lm-btn lm-btn--sm", "重试");
     retry.type = "button";
     retry.addEventListener("click", () => {
-      loadProfiles();
+      loadChains();
     });
     retryRow.appendChild(retry);
     wrap.appendChild(retryRow);
     return;
   }
 
-  const profiles = state.profiles;
-  if (ui.profilesCount) ui.profilesCount.textContent = String(profiles.length);
-  if (ui.profilesHint) {
-    ui.profilesHint.textContent = profiles.length ? "来自 AstrBot 框架的配置文件" : "";
-  }
-
-  if (state.unmatched.length) {
-    const notice = el("div", "lm-inline-notice lm-inline-notice--warn");
-    notice.appendChild(el("strong", null, "有路由指向框架里不存在的配置文件："));
-    notice.appendChild(el("span", "lm-mono", state.unmatched.join("、")));
-    wrap.appendChild(notice);
+  const profiles = state;
+  if (ui.chainsCount) ui.chainsCount.textContent = String(profiles.length);
+  if (ui.chainsHint) {
+    ui.chainsHint.textContent = profiles.length ? "按框架配置文件展示实际尝试顺序" : "";
   }
 
   if (!profiles.length) {
     const empty = el("div", "lm-empty");
-    empty.appendChild(el("strong", null, "没有读取到配置文件"));
+    empty.appendChild(el("strong", null, "没有读取到配置文件链路"));
     empty.appendChild(
-      el("span", null, "框架未返回任何配置文件信息；若这是新装环境，先在 AstrBot 里创建/保存一次配置文件。"),
+      el("span", null, "框架未返回任何配置文件；先在 AstrBot 里保存一次配置文件后刷新本页。"),
     );
     wrap.appendChild(empty);
     return;
   }
 
-  const scroll = el("div", "lm-table-scroll");
-  const table = el("table", "lm-table");
-  const thead = el("thead");
-  const headRow = el("tr");
-  for (const title of ["配置文件名", "id", "框架默认模型", "状态"]) {
-    headRow.appendChild(el("th", null, title));
-  }
-  thead.appendChild(headRow);
-  table.appendChild(thead);
-
-  const tbody = el("tbody");
+  const list = el("ul", "lm-chain-list");
   for (const profile of profiles) {
-    const row = el("tr");
+    const item = el("li", "lm-chain-item");
 
-    const nameCell = el("td");
+    const head = el("div", "lm-chain-head");
     const nameLine = el("div");
     nameLine.appendChild(
-      el("span", null, profile.name || profile.id || "（未命名配置文件）"),
+      el("span", "lm-chain-name", profile.name || profile.id || "（未命名配置文件）"),
     );
     if (profile.isDefault) {
       nameLine.appendChild(el("span", "lm-badge lm-badge--ok lm-badge--inline", "默认"));
     }
-    nameCell.appendChild(nameLine);
-    if (profile.path) {
-      nameCell.appendChild(el("span", "lm-cell-note lm-mono", profile.path));
+    head.appendChild(nameLine);
+
+    const metaParts = [];
+    if (profile.id) metaParts.push(profile.id);
+    if (profile.path) metaParts.push(profile.path);
+    if (metaParts.length) {
+      head.appendChild(el("span", "lm-chain-meta lm-mono", metaParts.join(" · ")));
     }
-    row.appendChild(nameCell);
+    item.appendChild(head);
 
-    row.appendChild(el("td", "lm-mono", profile.id || "—"));
-
-    const providerCell = el("td");
-    if (profile.defaultProvider) {
-      providerCell.appendChild(el("span", "lm-mono", profile.defaultProvider));
-      if (profile.defaultProviderExists === false) {
-        providerCell.appendChild(
-          el("span", "lm-cell-note", "（模型已不存在，请到该配置文件里重新选择默认模型）"),
-        );
-      }
+    const pipeline = el("div", "lm-pipeline");
+    if (!profile.chain.length) {
+      pipeline.appendChild(el("span", "lm-hint", "该配置文件未设置默认模型"));
     } else {
-      providerCell.appendChild(el("span", "lm-hint", "未配置"));
+      const bypassedSet = new Set(profile.bypassed);
+      profile.chain.forEach((providerId, index) => {
+        if (index > 0) pipeline.appendChild(el("span", "lm-pipeline-arrow", "→"));
+        pipeline.appendChild(chainStep(providerId, bypassedSet));
+      });
     }
-    row.appendChild(providerCell);
+    item.appendChild(pipeline);
 
-    const statusCell = el("td");
-    statusCell.appendChild(profileStatusBadge(profile));
-    row.appendChild(statusCell);
-
-    tbody.appendChild(row);
-  }
-  table.appendChild(tbody);
-  scroll.appendChild(table);
-  wrap.appendChild(scroll);
-}
-
-/* ---------- 渲染：路由 ---------- */
-
-function renderRoutes(data) {
-  const wrap = ui.routesWrap;
-  if (!wrap) return;
-  clearNode(wrap);
-  const routes = data ? data.routes : [];
-
-  if (ui.routesCount) ui.routesCount.textContent = data ? String(routes.length) : "—";
-  if (ui.routesHint) {
-    ui.routesHint.textContent = data
-      ? routes.length
-        ? "来自插件配置的模型路由"
-        : ""
-      : "";
-  }
-
-  if (!data) {
-    wrap.appendChild(el("div", "lm-empty", "尚未获取到路由数据。"));
-    return;
-  }
-  if (!routes.length) {
-    const empty = el("div", "lm-empty");
-    empty.appendChild(el("strong", null, "还没有配置模型路由"));
-    empty.appendChild(
-      el(
-        "span",
-        null,
-        "请在插件配置的「模型路由」中新增条目（配置文件 default 或对应 uuid），填写主模型与回退模型后刷新本页。",
-      ),
-    );
-    wrap.appendChild(empty);
-    return;
-  }
-
-  const scroll = el("div", "lm-table-scroll");
-  const table = el("table", "lm-table");
-  const thead = el("thead");
-  const headRow = el("tr");
-  for (const title of ["配置文件", "主模型", "回退链", "生效链", "来源", "跳过", "告警"]) {
-    headRow.appendChild(el("th", null, title));
-  }
-  thead.appendChild(headRow);
-  table.appendChild(thead);
-
-  const tbody = el("tbody");
-  for (const route of routes) {
-    const row = el("tr");
-
-    const profileCell = el("td");
-    const profileDisplay = route.profileDisplay || route.profileId || "";
-    profileCell.appendChild(el("div", null, profileDisplay || "—"));
-    // 有友好名称时，把裸 id 作为小字备注保留，方便与后端日志/配置核对。
-    if (route.profileId && profileDisplay !== route.profileId) {
-      profileCell.appendChild(el("span", "lm-cell-note lm-mono", route.profileId));
-    }
-    row.appendChild(profileCell);
-
-    const primaryCell = el("td");
-    primaryCell.appendChild(el("span", "lm-mono", route.primary || "（未配置）"));
-    if (!route.primary) {
-      primaryCell.appendChild(el("span", "lm-cell-note", "主模型为空，该路由不生效"));
-    }
-    row.appendChild(primaryCell);
-
-    row.appendChild(
-      el("td", "lm-mono", route.fallbacks.length ? route.fallbacks.join(" → ") : "—"),
-    );
-
-    const chainCell = el("td", "lm-mono");
-    const chainText = route.chain.length ? route.chain.join(" → ") : "";
-    chainCell.textContent = chainText || "—";
-    if (route.degradedUse) {
-      chainCell.appendChild(
-        el("span", "lm-cell-note", `全部候选已标记，降级使用 ${route.degradedUse}`),
+    if (profile.chain.length && !profile.currentProvider) {
+      item.appendChild(
+        el("p", "lm-chain-note", "该配置文件未设置默认模型，链路来自框架的回退配置。"),
       );
     }
-    row.appendChild(chainCell);
-
-    row.appendChild(el("td", null, route.source || "—"));
-
-    const skipCell = el("td");
-    const skipped = Array.from(new Set([...route.marked, ...route.bypassed]));
-    if (skipped.length) {
-      for (const id of skipped) {
-        skipCell.appendChild(el("span", "lm-badge lm-badge--warn", id));
-      }
-    } else {
-      skipCell.textContent = "—";
-    }
-    row.appendChild(skipCell);
-
-    const warnCell = el("td");
-    if (route.warnings.length) {
-      for (const warning of route.warnings) {
-        warnCell.appendChild(el("span", "lm-cell-note", warning));
-      }
-    }
-    if (route.missing.length) {
-      warnCell.appendChild(
-        el("span", "lm-cell-note", `配置中的模型不存在：${route.missing.join("、")}`),
+    if (profile.missing.length) {
+      item.appendChild(
+        el(
+          "p",
+          "lm-chain-note lm-chain-note--warn",
+          `配置里引用了不存在的模型：${profile.missing.join("、")}`,
+        ),
       );
     }
-    if (!warnCell.firstChild && route.unmatched !== null && route.unmatched !== undefined) {
-      warnCell.appendChild(
-        el("span", "lm-cell-note", `${fmtInt(route.unmatched)} 个会话未匹配到路由`),
+    const markedOutside = profile.bypassed.filter((id) => !profile.chain.includes(id));
+    if (markedOutside.length) {
+      item.appendChild(
+        el("p", "lm-chain-note", `已标记但不在当前链路中：${markedOutside.join("、")}`),
       );
     }
-    if (!warnCell.firstChild) warnCell.textContent = "—";
-    row.appendChild(warnCell);
 
-    tbody.appendChild(row);
+    list.appendChild(item);
   }
-  table.appendChild(tbody);
-  scroll.appendChild(table);
-  wrap.appendChild(scroll);
+  wrap.appendChild(list);
 }
 
 /* ---------- 渲染：模型统计表 ---------- */
@@ -1066,6 +964,20 @@ function actionButton(label, action, providerId, extraClass) {
   return button;
 }
 
+/** 状态列第二行：被标记的模型显示验证进度（连续成功 N/阈值）。 */
+function statusSuccessNote(provider, config) {
+  const success = provider.consecutiveSuccess;
+  const threshold = config ? config.probeSuccessThreshold : null;
+  if (!provider.marked) {
+    return success !== null && success > 0 ? `验证连续成功 ${fmtInt(success)} 次` : "";
+  }
+  if (success === null) return "";
+  if (threshold !== null) {
+    return `验证连续成功 ${fmtInt(success)}/${fmtInt(threshold)} 次`;
+  }
+  return `验证连续成功 ${fmtInt(success)} 次`;
+}
+
 function renderProviders(data) {
   const wrap = ui.providersWrap;
   if (!wrap) return;
@@ -1105,7 +1017,7 @@ function renderProviders(data) {
   const table = el("table", "lm-table");
   const thead = el("thead");
   const headRow = el("tr");
-  const headers = ["模型 ID", "模型名", "调用", "成功率", "平均延迟", "最近错误", "状态"];
+  const headers = ["模型 ID", "模型名", "调用", "成功率", "平均延迟", "最近错误类别", "状态"];
   if (showActions) headers.push("操作");
   for (const title of headers) headRow.appendChild(el("th", null, title));
   thead.appendChild(headRow);
@@ -1139,12 +1051,15 @@ function renderProviders(data) {
     }
     row.appendChild(latencyCell);
 
-    const errorCell = el("td");
-    const errorSummary = [item.errorClass, item.errorMessage].filter(Boolean).join(" · ");
-    if (errorSummary) {
-      const span = el("span", "lm-ellipsis", errorSummary);
-      span.title = errorSummary;
-      errorCell.appendChild(span);
+    const errorCell = el("td", "lm-mono");
+    if (item.errorClass) {
+      errorCell.textContent = item.errorClass;
+      // 鼠标悬停给出各错误类别的次数与最近错误摘要（都用 textContent/title，不拼 HTML）。
+      const classCounts = Object.keys(item.errorClasses || {})
+        .map((name) => `${name}×${item.errorClasses[name]}`)
+        .join("，");
+      const titleParts = [classCounts, item.errorMessage].filter(Boolean);
+      if (titleParts.length) errorCell.title = titleParts.join(" | ");
     } else {
       errorCell.textContent = "—";
     }
@@ -1152,6 +1067,8 @@ function renderProviders(data) {
 
     const stateCell = el("td");
     stateCell.appendChild(markBadge(item.state));
+    const successNote = statusSuccessNote(item, data.config);
+    if (successNote) stateCell.appendChild(el("span", "lm-cell-note", successNote));
     row.appendChild(stateCell);
 
     if (showActions) {
@@ -1172,80 +1089,6 @@ function renderProviders(data) {
   table.appendChild(tbody);
   scroll.appendChild(table);
   wrap.appendChild(scroll);
-}
-
-/* ---------- 渲染：标记详情 ---------- */
-
-function renderMarks(data) {
-  const wrap = ui.marksWrap;
-  if (!wrap) return;
-  clearNode(wrap);
-  const marks = data ? data.marks : [];
-
-  if (ui.marksCount) ui.marksCount.textContent = data ? String(marks.length) : "—";
-
-  if (!data) {
-    wrap.appendChild(el("div", "lm-empty", "尚未获取到标记数据。"));
-    return;
-  }
-  if (!marks.length) {
-    const empty = el("div", "lm-empty");
-    empty.appendChild(el("strong", null, "当前没有被标记的模型"));
-    empty.appendChild(
-      el(
-        "span",
-        null,
-        "调用失败达到阈值、或手动标记后，被标记的模型会出现在这里，并在测活成功后自动解除。",
-      ),
-    );
-    wrap.appendChild(empty);
-    return;
-  }
-
-  const list = el("ul", "lm-mark-list");
-  for (const mark of marks) {
-    const item = el("li", "lm-mark-item");
-    const head = el("div", "lm-mark-head");
-    head.appendChild(el("span", "lm-mark-id", providerIdOf(mark) || "（未知模型）"));
-    head.appendChild(markBadge(readMarkState(mark)));
-    item.appendChild(head);
-
-    const detail = markDetailOf(mark);
-    const kv = el("dl", "lm-kv");
-    const addRow = (label, value) => {
-      kv.appendChild(el("dt", null, label));
-      kv.appendChild(el("dd", null, value));
-    };
-    addRow("分类", detail.category || "—");
-    addRow("原因", detail.reason || "—");
-    addRow("标记时间", fmtTime(pick(mark, ["marked_at", "marked_time", "at"])));
-    const nextProbe = pick(mark, ["next_probe_at", "next_probe", "next_probe_time"]);
-    if (nextProbe !== undefined) addRow("下次探测", fmtTime(nextProbe));
-    const expiresAt = pick(mark, ["expires_at", "expire_at", "ttl_expires_at"]);
-    if (expiresAt !== undefined) addRow("自动解除", fmtTime(expiresAt));
-    const firstSuccess = pick(mark, ["first_success_at"]);
-    if (firstSuccess !== undefined) addRow("首次测活成功", fmtTime(firstSuccess));
-    const probeAttempts = pick(mark, ["probe_attempts", "probe_count"]);
-    if (probeAttempts !== undefined) addRow("测活次数", fmtInt(probeAttempts));
-    const probeFailures = pick(mark, ["consecutive_probe_failures"]);
-    if (probeFailures !== undefined) addRow("连续测活失败", fmtInt(probeFailures));
-    const lastProbeAt = pick(mark, ["last_probe_at"]);
-    if (lastProbeAt !== undefined) addRow("上次测活", fmtTime(lastProbeAt));
-    const lastProbeError = pick(mark, ["last_probe_error"]);
-    if (lastProbeError !== undefined) addRow("测活错误", String(lastProbeError));
-    const markCount = pick(mark, ["mark_count"]);
-    if (markCount !== undefined && asNumber(markCount) !== null && asNumber(markCount) > 1) {
-      addRow("累计标记", fmtInt(markCount));
-    }
-    const source = pick(mark, ["source"]);
-    if (source !== undefined) addRow("来源", source === "manual" ? "手动" : "自动");
-    const profileHint = pick(mark, ["profile_hint", "profile_id"]);
-    if (profileHint !== undefined) addRow("配置文件", profileHint);
-    item.appendChild(kv);
-
-    list.appendChild(item);
-  }
-  wrap.appendChild(list);
 }
 
 /* ---------- 渲染：最近事件 ---------- */
@@ -1301,7 +1144,7 @@ function renderEvents() {
   const table = el("table", "lm-table");
   const thead = el("thead");
   const headRow = el("tr");
-  for (const title of ["时间", "配置文件", "请求模型", "实际使用", "结果", "总耗时", "错误分类"]) {
+  for (const title of ["时间", "请求模型", "实际使用", "结果", "总耗时", "错误类别"]) {
     headRow.appendChild(el("th", null, title));
   }
   thead.appendChild(headRow);
@@ -1311,7 +1154,6 @@ function renderEvents() {
   for (const event of rows) {
     const row = el("tr");
     row.appendChild(el("td", "lm-num", fmtTime(pick(event, ["ts", "time", "at", "timestamp"]))));
-    row.appendChild(el("td", "lm-mono", String(pick(event, ["profile_id", "profile"]) || "—")));
     row.appendChild(
       el("td", "lm-mono", String(pick(event, ["requested", "requested_provider"]) || "—")),
     );
@@ -1383,10 +1225,8 @@ function renderAll() {
   const data = pageState.overview;
   renderSummary(data);
   renderCards(data);
-  renderProfiles();
-  renderRoutes(data);
+  renderChains();
   renderProviders(data);
-  renderMarks(data);
   syncEventFilterOptions(data);
   renderEvents();
   renderActionHint(data);
@@ -1498,32 +1338,40 @@ async function refreshAll() {
     pageState.loading = false;
     setBusy(ui.refreshButton, false);
     renderSummary(pageState.overview);
-    // 配置文件区独立加载：即使 overview 失败，它也能给出版本/错误提示。
-    loadProfiles();
+    // 链路区独立加载：即使 overview 失败，它也能给出自己的提示。
+    loadChains();
   }
 }
 
-/** GET /profiles：独立容错，失败不影响其它面板。 */
-async function loadProfiles() {
+/** GET /chains：独立容错，失败不影响其它区块。 */
+async function loadChains() {
   // 已确认后端没有该端点时不再每轮轮询，避免每次刷新都打一次 404。
-  if (pageState.profilesUnsupported) return;
+  if (pageState.chainsUnsupported) return;
   try {
-    const raw = await apiGet("profiles");
-    pageState.profiles = normalizeProfiles(raw);
-    pageState.profilesUnsupported = false;
-    pageState.profilesError = "";
+    const raw = await apiGet("chains");
+    pageState.chains = normalizeChains(raw);
+    pageState.chainsUnsupported = false;
+    pageState.chainsError = "";
   } catch (error) {
     if (isRouteMissing(error)) {
-      // 后端尚未注册 /profiles：显示「未提供」，不当作错误。
-      pageState.profilesUnsupported = true;
-      pageState.profiles = null;
-      pageState.profilesError = "";
+      // 后端尚未注册 /chains：若 overview 里已带同一份链路就直接用，
+      // 否则显示「未提供」，不当作错误。
+      const fallback = pageState.overview ? pageState.overview.chains : null;
+      if (fallback && fallback.length) {
+        pageState.chains = fallback;
+        pageState.chainsUnsupported = false;
+        pageState.chainsError = "";
+      } else {
+        pageState.chainsUnsupported = true;
+        pageState.chains = null;
+        pageState.chainsError = "";
+      }
     } else {
-      pageState.profiles = null;
-      pageState.profilesError = errorText(error);
+      pageState.chains = null;
+      pageState.chainsError = errorText(error);
     }
   }
-  renderProfiles();
+  renderChains();
 }
 
 async function loadEvents() {
@@ -1616,7 +1464,6 @@ async function runProviderAction(providerId, action, button) {
     const form = await openMarkModal(providerId);
     if (!form) return;
     if (form.reason) body.reason = form.reason;
-    if (form.ttl !== null) body.ttl = form.ttl;
   }
 
   setActionBusy(providerId, action, true);
@@ -1666,10 +1513,9 @@ function openMarkModal(providerId) {
   return new Promise((resolve) => {
     modalResolve = resolve;
     if (ui.modalDesc) {
-      ui.modalDesc.textContent = `为模型 ${providerId} 手动打上标记。标记后该模型会在路由链中被跳过，直到测活成功（开启了二次确认时需连续成功）。`;
+      ui.modalDesc.textContent = `为模型 ${providerId} 手动打上标记。标记后请求会在链路里跳过它，直到验证连续成功达到阈值后自动解除。`;
     }
     if (ui.markReason) ui.markReason.value = "";
-    if (ui.markTtl) ui.markTtl.value = "";
     ui.modal.hidden = false;
     focusIfPossible(ui.markReason);
   });
@@ -1684,18 +1530,7 @@ function closeModal(result) {
 
 function confirmModal() {
   const reason = ui.markReason ? ui.markReason.value.trim() : "";
-  const ttlRaw = ui.markTtl ? ui.markTtl.value.trim() : "";
-  let ttl = null;
-  if (ttlRaw) {
-    const parsed = Number(ttlRaw);
-    if (!Number.isFinite(parsed) || parsed <= 0 || !Number.isInteger(parsed)) {
-      pushToast("error", "标记时长必须是大于 0 的整数秒（留空表示使用默认值）");
-      focusIfPossible(ui.markTtl);
-      return;
-    }
-    ttl = parsed;
-  }
-  closeModal({ reason, ttl });
+  closeModal({ reason });
 }
 
 /* ---------- 自动刷新 ---------- */
@@ -1759,21 +1594,15 @@ function cacheDom() {
   ui.reloadButton = $("lmReloadBtn");
   ui.autoToggle = $("lmAutoToggle");
   ui.intervalSelect = $("lmIntervalSelect");
-  ui.profilesWrap = $("lmProfilesWrap");
-  ui.profilesCount = $("lmProfilesCount");
-  ui.profilesHint = $("lmProfilesHint");
-  ui.routesWrap = $("lmRoutesWrap");
-  ui.routesCount = $("lmRoutesCount");
-  ui.routesHint = $("lmRoutesHint");
+  ui.chainsWrap = $("lmChainsWrap");
+  ui.chainsCount = $("lmChainsCount");
+  ui.chainsHint = $("lmChainsHint");
   ui.providersWrap = $("lmProvidersWrap");
   ui.providersCount = $("lmProvidersCount");
   ui.providerFilter = $("lmProviderFilter");
   ui.sortErrors = $("lmSortErrors");
   ui.sortLatency = $("lmSortLatency");
   ui.actionHint = $("lmActionHint");
-  ui.marksWrap = $("lmMarksWrap");
-  ui.marksCount = $("lmMarksCount");
-  ui.marksHint = $("lmMarksHint");
   ui.eventsPanel = $("lmEventsPanel");
   ui.eventsWrap = $("lmEventsWrap");
   ui.eventsCount = $("lmEventsCount");
@@ -1783,7 +1612,6 @@ function cacheDom() {
   ui.modalTitle = $("lmModalTitle");
   ui.modalDesc = $("lmModalDesc");
   ui.markReason = $("lmMarkReason");
-  ui.markTtl = $("lmMarkTtl");
   ui.modalConfirm = $("lmModalConfirm");
   ui.modalCancel = $("lmModalCancel");
 }
@@ -1874,7 +1702,7 @@ function showBridgeMissing() {
   if (ui.refreshButton) ui.refreshButton.disabled = true;
   if (ui.autoToggle) ui.autoToggle.disabled = true;
   const message = "无法连接 AstrBot（缺少页面桥接），请在 WebUI 中打开本页面。";
-  for (const wrap of [ui.profilesWrap, ui.routesWrap, ui.providersWrap, ui.marksWrap]) {
+  for (const wrap of [ui.chainsWrap, ui.providersWrap]) {
     if (!wrap) continue;
     clearNode(wrap);
     wrap.appendChild(el("div", "lm-empty", message));

@@ -1,4 +1,9 @@
-"""Web API 契约单测：信封结构、视图字段、写操作门控与 limit 夹紧。"""
+"""Web API 契约单测（v0.2.0）：信封结构、链路视图、事件与写操作门控。
+
+v0.2.0 的端点：``overview`` / ``chains`` / ``events`` / ``mark`` / ``unmark`` /
+``probe`` / ``reload``（已删除 ``profiles``、``schema_refresh``、``routes``、
+``health``）。
+"""
 
 from __future__ import annotations
 
@@ -13,10 +18,7 @@ from .support import FakeAcm, FakeProvider, build_runtime
 
 UMO = "aiocqhttp:FriendMessage:40004"
 
-CONFIG = {
-    "routes": [{"profile_id": "default", "primary": "p1", "fallbacks": ["p2"]}],
-    "stats_recent_events": 20,
-}
+CONFIG: dict = {}
 
 
 def make_runtime(tmp_path: Path, *, config: dict | None = None):
@@ -25,6 +27,8 @@ def make_runtime(tmp_path: Path, *, config: dict | None = None):
         config=CONFIG if config is None else config,
         providers=[FakeProvider("p1"), FakeProvider("p2")],
         profiles={UMO: "default"},
+        defaults={"default": "p1"},
+        conf_fallbacks={"default": ["p2"]},
     )
 
 
@@ -37,7 +41,12 @@ def seed(runtime) -> None:
         AttemptRecord(ts=runtime.clock.now, used="p1", ok=True, total_ms=80,
                       profile_id="default", umo=UMO)
     )
-    asyncio.run(runtime.guardian.mark("p1", reason="rate_limit", ttl=300, detail="429"))
+    asyncio.run(runtime.guardian.mark("p1", reason="rate_limit"))
+
+
+# ---------------------------------------------------------------------------
+# 信封
+# ---------------------------------------------------------------------------
 
 
 def test_envelope_helpers() -> None:
@@ -48,6 +57,11 @@ def test_envelope_helpers() -> None:
     assert error["message"] == "坏了"
     assert error["data"] is None
     assert json.loads(json.dumps(ok))["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# overview
+# ---------------------------------------------------------------------------
 
 
 def test_overview_shape(tmp_path: Path) -> None:
@@ -65,7 +79,7 @@ def test_overview_shape(tmp_path: Path) -> None:
         "stats",
         "providers",
         "marks",
-        "routes",
+        "chains",
     ):
         assert key in data, key
 
@@ -93,31 +107,81 @@ def test_overview_shape(tmp_path: Path) -> None:
     for key in ("calls", "ok", "errors", "success_rate", "latency_ms", "last_error", "model"):
         assert key in provider_view["p1"], key
 
-    route_view = data["routes"][0]
+    # v0.2.0 的配置摘要就是那 8 个键。
     for key in (
-        "profile_id",
-        "primary",
-        "fallbacks",
-        "effective_chain",
-        "source",
-        "marked",
-        "bypassed",
-        "degraded_use",
-        "warnings",
+        "enable",
+        "request_timeout_seconds",
+        "max_retries",
+        "retry_backoff_seconds",
+        "retry_categories",
+        "probe_interval_seconds",
+        "probe_timeout_seconds",
+        "probe_success_threshold",
     ):
-        assert key in route_view, key
-    assert route_view["bypassed"] == ["p1"]
+        assert key in data["config"], key
 
     json.dumps(data, ensure_ascii=False)  # 必须可直接序列化
 
 
-def test_routes_view(tmp_path: Path) -> None:
+# ---------------------------------------------------------------------------
+# chains
+# ---------------------------------------------------------------------------
+
+
+def test_chains_view(tmp_path: Path) -> None:
+    """``/chains`` 展示每个配置文件的模型顺序。"""
     runtime = make_runtime(tmp_path)
-    data = web_api.build_routes(runtime.guard)
-    assert data["profiles"][0]["profile_id"] == "default"
-    assert len(data["routes"]) == 1
-    filtered = web_api.build_routes(runtime.guard, profile_id="nope")
-    assert filtered["routes"] == []
+    data = web_api.build_chains(runtime.guard)
+    assert "profiles" in data
+    assert "chains" in data
+    chains = data["chains"]
+    assert chains
+    item = chains[0]
+    for key in (
+        "profile_id",
+        "profile_name",
+        "profile_display",
+        "default_provider",
+        "fallbacks",
+        "chain",
+        "marked",
+        "missing",
+    ):
+        assert key in item, key
+    assert item["default_provider"] == "p1"
+    assert item["fallbacks"] == ["p2"]
+    assert item["chain"] == ["p1", "p2"]
+
+
+def test_chains_filter_by_profile(tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+    filtered = web_api.build_chains(runtime.guard, profile_id="nope")
+    assert filtered["chains"] == []
+
+
+def test_chains_shows_marked(tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+    asyncio.run(runtime.guardian.mark("p1", reason="rate_limit"))
+    chains = web_api.build_chains(runtime.guard)["chains"]
+    assert chains[0]["marked"] == ["p1"]
+    assert chains[0]["chain"] == ["p2"]
+
+
+def test_chains_fallback_to_default_profile(tmp_path: Path) -> None:
+    """读不到配置文件列表时至少有 default。"""
+    runtime = build_runtime(
+        tmp_path,
+        config=CONFIG,
+        providers=[FakeProvider("p1")],
+    )
+    runtime.context.astrbot_config_mgr = FakeAcm()
+    chains = web_api.collect_chains(runtime.guard)
+    assert any(item["profile_id"] == "default" for item in chains)
+
+
+# ---------------------------------------------------------------------------
+# events
+# ---------------------------------------------------------------------------
 
 
 def test_events_limit_clamped(tmp_path: Path) -> None:
@@ -131,29 +195,47 @@ def test_events_limit_clamped(tmp_path: Path) -> None:
     assert web_api.parse_limit("7") == 7
 
 
-def test_health_view(tmp_path: Path) -> None:
-    runtime = make_runtime(tmp_path)
-    data = web_api.build_health(runtime.guard)
-    for key in (
-        "wrapped",
-        "supervisor",
-        "internal_errors",
-        "provider_manager",
-        "enabled",
-        "allow_actions",
-        "state_file",
-    ):
-        assert key in data, key
-    assert data["supervisor"] in ("running", "stopped")
-    assert data["enabled"] is True
+# ---------------------------------------------------------------------------
+# 写操作
+# ---------------------------------------------------------------------------
 
 
 def test_write_actions_require_allow_actions(tmp_path: Path) -> None:
-    runtime = make_runtime(tmp_path)
+    """显式关闭 ``allow_webui_actions`` 时写操作被拒绝。"""
+    runtime = make_runtime(tmp_path, config={"allow_webui_actions": False})
     gated = asyncio.run(web_api.perform_action(runtime.guard, "mark", {"provider_id": "p1"}))
     assert gated["status"] == "error"
     assert "allow_webui_actions" in gated["message"]
     assert runtime.guardian.has_marked() is False
+
+
+def test_write_actions_allowed_by_default(tmp_path: Path) -> None:
+    """默认**关闭**写操作；显式开启后可用。"""
+    runtime = make_runtime(tmp_path)
+    assert runtime.guard.settings.allow_webui_actions is False
+    blocked = asyncio.run(
+        web_api.perform_action(runtime.guard, "mark", {"provider_id": "p1"})
+    )
+    assert blocked["status"] == "error"
+    assert "allow_webui_actions" in blocked["message"]
+
+    enabled = make_runtime(tmp_path / "on", config={"allow_webui_actions": True})
+    result = asyncio.run(
+        web_api.perform_action(enabled.guard, "mark", {"provider_id": "p1"})
+    )
+    assert result["status"] == "ok"
+    assert result["data"]["marked"] is True
+
+
+def test_overview_allow_actions_reflects_config(tmp_path: Path) -> None:
+    """``/overview`` 的 ``runtime.allow_actions`` 反映真实配置值。"""
+    disabled = make_runtime(tmp_path)
+    assert web_api.build_overview(disabled.guard)["runtime"]["allow_actions"] is False
+
+    enabled = make_runtime(
+        tmp_path / "on", config={"allow_webui_actions": True}
+    )
+    assert web_api.build_overview(enabled.guard)["runtime"]["allow_actions"] is True
 
 
 def test_mark_and_unmark_via_api(tmp_path: Path) -> None:
@@ -213,9 +295,9 @@ def test_action_errors_are_envelopes(tmp_path: Path) -> None:
 
 
 def test_probe_all_via_api(tmp_path: Path) -> None:
-    config = dict(CONFIG, allow_webui_actions=True, double_confirm=False)
+    config = dict(CONFIG, allow_webui_actions=True, probe_success_threshold=1)
     runtime = make_runtime(tmp_path, config=config)
-    asyncio.run(runtime.guardian.mark("p1", reason="auth", ttl=0))
+    asyncio.run(runtime.guardian.mark("p1", reason="auth"))
     result = asyncio.run(web_api.perform_action(runtime.guard, "probe_all", {}))
     assert result["status"] == "ok"
     assert len(result["data"]["results"]) == 1
@@ -235,7 +317,7 @@ def test_reload_endpoint(tmp_path: Path) -> None:
     runtime = make_runtime(tmp_path, config=config)
 
     async def _reload() -> str:
-        return "已重载：路由 1 条"
+        return "已重载"
 
     result = asyncio.run(
         web_api.perform_action(runtime.guard, "reload", {}, reload_callback=_reload)
@@ -244,8 +326,9 @@ def test_reload_endpoint(tmp_path: Path) -> None:
     assert result["data"]["reloaded"] is True
     assert "已重载" in result["data"]["summary"]
 
-    # 默认（allow_webui_actions=false）时必须被门控
-    gated_runtime = make_runtime(tmp_path / "gated")
+    gated_runtime = make_runtime(
+        tmp_path / "gated", config={"allow_webui_actions": False}
+    )
     gated = asyncio.run(
         web_api.perform_action(gated_runtime.guard, "reload", {}, reload_callback=_reload)
     )
@@ -266,6 +349,11 @@ def test_probe_response_has_ok_and_latency(tmp_path: Path) -> None:
     assert data["provider_id"] == "p1"
 
 
+# ---------------------------------------------------------------------------
+# 路由清单
+# ---------------------------------------------------------------------------
+
+
 def test_route_handlers_use_plugin_prefix() -> None:
     routes = {route for route, _method in web_api.route_handlers()}
     assert all(route.startswith("/astrbot_plugin_llm_model_guard/") for route in routes)
@@ -273,15 +361,32 @@ def test_route_handlers_use_plugin_prefix() -> None:
     assert web_api.ROUTE_RELOAD in routes
 
 
-def test_profiles_fallback_to_default(tmp_path: Path) -> None:
-    runtime = build_runtime(
-        tmp_path,
-        config=CONFIG,
-        providers=[FakeProvider("p1")],
-    )
-    runtime.context.astrbot_config_mgr = FakeAcm()
-    profiles = web_api.collect_profiles(runtime.guard)
-    assert any(item["profile_id"] == "default" for item in profiles)
+def test_v2_route_set_is_exactly_seven() -> None:
+    """v0.2.0 的端点集合固定为 7 个。"""
+    routes = {route for route, _method in web_api.route_handlers()}
+    assert routes == {
+        web_api.ROUTE_OVERVIEW,
+        web_api.ROUTE_CHAINS,
+        web_api.ROUTE_EVENTS,
+        web_api.ROUTE_MARK,
+        web_api.ROUTE_UNMARK,
+        web_api.ROUTE_PROBE,
+        web_api.ROUTE_RELOAD,
+    }
+
+
+def test_removed_endpoints_are_gone() -> None:
+    """v0.1.x 的 ``/profiles``、``/schema_refresh``、``/routes``、``/health`` 已删除。"""
+    routes = {route for route, _method in web_api.route_handlers()}
+    assert "/astrbot_plugin_llm_model_guard/profiles" not in routes
+    assert "/astrbot_plugin_llm_model_guard/schema_refresh" not in routes
+    assert "/astrbot_plugin_llm_model_guard/routes" not in routes
+    assert "/astrbot_plugin_llm_model_guard/health" not in routes
+
+
+# ---------------------------------------------------------------------------
+# 其它
+# ---------------------------------------------------------------------------
 
 
 def test_provider_model_name(tmp_path: Path) -> None:
@@ -302,55 +407,29 @@ def test_no_duplicate_success_records(tmp_path: Path) -> None:
     assert all(set(event) >= {"ts", "used", "ok"} for event in events["events"])
 
 
-# ---------------------------------------------------------------------------
-# 第 2 轮修复：P1-1 profile 作用域标记在页面/命令里可见
-# ---------------------------------------------------------------------------
-
-
-def test_profile_marks_visible_in_api(tmp_path: Path) -> None:
-    config = dict(CONFIG, mark_scope="profile")
-    runtime = build_runtime(
-        tmp_path,
-        config=config,
-        providers=[FakeProvider("p1"), FakeProvider("p2")],
-        profiles={UMO: "default"},
-    )
-    asyncio.run(
-        runtime.guardian.mark("p1", reason="auth", ttl=300, profile_hint="default")
-    )
-
+def test_marks_visible_in_api(tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+    seed(runtime)
     data = web_api.build_overview(runtime.guard)
     assert data["runtime"]["marked"] == 1
     provider_view = {item["provider_id"]: item for item in data["providers"]}
     assert provider_view["p1"]["marked_state"] == "marked"
-    assert provider_view["p1"]["marked_reason"] == "auth"
+    assert provider_view["p1"]["marked_reason"] == "rate_limit"
     assert any(item["provider_id"] == "p1" for item in data["marks"])
 
-    route_view = data["routes"][0]
-    assert "p1" in route_view["bypassed"]
-    assert route_view["effective_chain"] == ["p2"]
 
-
-def test_profile_marks_visible_in_commands(tmp_path: Path) -> None:
+def test_marks_visible_in_commands(tmp_path: Path) -> None:
     from astrbot_plugin_llm_model_guard.core import commands as command_text
 
-    config = dict(CONFIG, mark_scope="profile")
-    runtime = build_runtime(
-        tmp_path,
-        config=config,
-        providers=[FakeProvider("p1"), FakeProvider("p2")],
-        profiles={UMO: "default"},
-    )
-    asyncio.run(
-        runtime.guardian.mark("p1", reason="auth", ttl=300, profile_hint="default")
-    )
+    runtime = make_runtime(tmp_path)
+    seed(runtime)
 
     marks_text = command_text.format_marks(runtime.guard)
     assert "p1" in marks_text
-    assert "作用域=default" in marks_text
+    assert "连续成功" in marks_text
 
     status_text = command_text.format_status(runtime.guard)
     assert "已标记: 1 个" in status_text
 
-    models_text = command_text.format_models(runtime.guard)
-    assert "[已标记]" in models_text
+    chains_text = command_text.format_chains(runtime.guard)
+    assert "p1" in chains_text

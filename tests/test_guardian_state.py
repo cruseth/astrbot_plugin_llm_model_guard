@@ -1,139 +1,75 @@
-"""标记状态机单测：TTL、手动解除、抖动冷却、连续失败阈值与作用域。"""
+"""标记状态机单测（v0.2.0）：全局标记、无 TTL、连续成功 N 次解除。
+
+v0.2.0 相对 v0.1.x 的变化：
+
+* **没有 TTL**：标记不会自己过期，只有连续验证成功才解除；
+* **没有 mark_scope**：标记统一按 provider 全局生效；
+* **没有双击确认态**：恢复判据是「连续成功 N 次」（``probe_success_threshold``）。
+"""
 
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
-from astrbot_plugin_llm_model_guard.core.models import MarkSource, MarkState
+from astrbot_plugin_llm_model_guard.core.models import AttemptRecord, MarkSource, MarkState
 
-from .support import FakeProvider, build_runtime
+from .support import FakeProvider, FakeResponse, StatusError, build_runtime
 
 
 def run(coro):
     return asyncio.run(coro)
 
 
-def test_mark_sets_ttl(tmp_path: Path) -> None:
+# ---------------------------------------------------------------------------
+# 标记
+# ---------------------------------------------------------------------------
+
+
+def test_mark_records_reason_and_no_ttl(tmp_path: Path) -> None:
     runtime = build_runtime(tmp_path, providers=[FakeProvider("p1")])
     marked = run(
         runtime.guardian.mark(
-            "p1", reason="rate_limit", ttl=300, source=MarkSource.AUTO, detail="429"
+            "p1", reason="rate_limit", source=MarkSource.AUTO, detail="429"
         )
     )
     assert marked is True
     view = runtime.guardian.marks()["p1"]
     assert view.state is MarkState.MARKED
     assert view.reason == "rate_limit"
-    assert view.expires_at == view.marked_at + 300
+    # v0.2.0 没有 TTL：标记不会自己过期。
+    assert not hasattr(view, "expires_at")
     assert view.next_probe_at == view.marked_at
     assert runtime.guardian.is_marked("p1") is True
     assert runtime.guardian.has_marked() is True
 
 
-def test_permanent_mark_has_no_expiry(tmp_path: Path) -> None:
+def test_mark_renewal_resets_success_counter(tmp_path: Path) -> None:
+    """重新标记会把连续成功计数归零（要重新累计）。"""
     runtime = build_runtime(tmp_path, providers=[FakeProvider("p1")])
-    run(runtime.guardian.mark("p1", reason="auth", ttl=0))
-    assert runtime.guardian.marks()["p1"].expires_at is None
-
-
-def test_ttl_expiry_by_supervisor(tmp_path: Path) -> None:
-    runtime = build_runtime(tmp_path, providers=[FakeProvider("p1")])
-    run(runtime.guardian.mark("p1", reason="rate_limit", ttl=60))
-    runtime.clock.advance(30)
-    assert run(runtime.guardian.expire_ttl()) == []
-    assert runtime.guardian.is_marked("p1") is True
-
-    runtime.clock.advance(31)
-    assert run(runtime.guardian.expire_ttl()) == ["p1"]
-    assert runtime.guardian.is_marked("p1") is False
-    assert runtime.guardian.has_marked() is False
-
-
-def test_tick_dispatches_due_probe(tmp_path: Path) -> None:
-    provider = FakeProvider("p1")
-    runtime = build_runtime(tmp_path, providers=[provider])
-    run(runtime.guardian.mark("p1", reason="rate_limit", ttl=0))
-
-    async def _tick_once() -> list[str]:
-        dispatched = await runtime.guardian.tick()
-        for _ in range(20):
-            await asyncio.sleep(0.01)
-        return dispatched
-
-    assert run(_tick_once()) == ["p1"]
-    assert provider.call_count == 1
-    # 默认双击确认：首次测活成功后进入 confirming，仍算被标记
-    assert runtime.guardian.is_marked("p1") is True
-
-
-def test_tick_skips_busy_provider(tmp_path: Path) -> None:
-    runtime = build_runtime(tmp_path, providers=[FakeProvider("p1")])
-    run(runtime.guardian.mark("p1", reason="rate_limit", ttl=0))
-    runtime.guardian.inc_active("p1")
-    assert run(runtime.guardian.tick()) == []
-    runtime.guardian.dec_active("p1")
-    assert run(runtime.guardian.tick()) == ["p1"]
-    # 清理 tick 里派发的任务，避免测试结束时留下未完成的协程
-    run(runtime.guardian.shutdown())
+    run(runtime.guardian.mark("p1", reason="auth"))
+    runtime.guardian._marks["p1"].consecutive_success = 1
+    run(runtime.guardian.mark("p1", reason="auth"))
+    assert runtime.guardian.marks()["p1"].consecutive_success == 0
+    assert runtime.guardian.marks()["p1"].mark_count == 2
 
 
 def test_manual_unmark(tmp_path: Path) -> None:
     runtime = build_runtime(tmp_path, providers=[FakeProvider("p1")])
-    run(runtime.guardian.mark("p1", reason="auth", ttl=0))
+    run(runtime.guardian.mark("p1", reason="auth"))
     assert run(runtime.guardian.unmark("p1", by="command")) is True
     assert runtime.guardian.has_marked() is False
-    # 再解一次返回 False（没有标记可解）
     assert run(runtime.guardian.unmark("p1", by="command")) is False
-
-
-def test_mark_renewal_keeps_marked_at(tmp_path: Path) -> None:
-    runtime = build_runtime(tmp_path, providers=[FakeProvider("p1")])
-    run(runtime.guardian.mark("p1", reason="auth", ttl=0))
-    first = runtime.guardian.marks()["p1"]
-    runtime.clock.advance(10)
-    run(runtime.guardian.mark("p1", reason="auth", ttl=0))
-    second = runtime.guardian.marks()["p1"]
-    assert second.marked_at == first.marked_at
-    assert second.mark_count == 2
-
-
-def test_flapping_cooldown(tmp_path: Path) -> None:
-    runtime = build_runtime(tmp_path, providers=[FakeProvider("p1")])
-    run(runtime.guardian.mark("p1", reason="network", ttl=0))
-    first_marked_at = runtime.guardian.marks()["p1"].marked_at
-    run(runtime.guardian.unmark("p1", by="command"))
-
-    runtime.clock.advance(5)
-    run(runtime.guardian.mark("p1", reason="network", ttl=0))
-    view = runtime.guardian.marks()["p1"]
-    assert view.marked_at == first_marked_at
-    assert runtime.metrics.counters.get("flapping") == 1
-
-
-def test_mark_delay_requires_consecutive_failures(tmp_path: Path) -> None:
-    runtime = build_runtime(tmp_path, providers=[FakeProvider("p1")])
-    assert run(runtime.guardian.mark("p1", reason="empty_output", ttl=120, delay=2)) is False
-    assert runtime.guardian.has_marked() is False
-    assert run(runtime.guardian.mark("p1", reason="empty_output", ttl=120, delay=2)) is True
-    assert runtime.guardian.is_marked("p1") is True
-
-
-def test_success_clears_failure_streak(tmp_path: Path) -> None:
-    runtime = build_runtime(tmp_path, providers=[FakeProvider("p1")])
-    run(runtime.guardian.mark("p1", reason="empty_output", ttl=120, delay=2))
-    runtime.guardian.note_success("p1")
-    assert run(runtime.guardian.mark("p1", reason="empty_output", ttl=120, delay=2)) is False
 
 
 def test_snapshot_is_immutable_view(tmp_path: Path) -> None:
     runtime = build_runtime(tmp_path, providers=[FakeProvider("p1")])
     snapshot_before = runtime.guardian.marks()
-    run(runtime.guardian.mark("p1", reason="auth", ttl=0))
+    run(runtime.guardian.mark("p1", reason="auth"))
     assert "p1" not in snapshot_before
     snapshot_after = runtime.guardian.marks()
     assert "p1" in snapshot_after
-    # MarkView 是 frozen dataclass：不能被就地改写
     try:
         snapshot_after["p1"].reason = "changed"  # type: ignore[misc]
     except Exception as exc:
@@ -142,25 +78,24 @@ def test_snapshot_is_immutable_view(tmp_path: Path) -> None:
         raise AssertionError("MarkView 应该是不可变的")
 
 
-def test_mark_scope_profile_key(tmp_path: Path) -> None:
+def test_marks_are_global_not_per_profile(tmp_path: Path) -> None:
+    """v0.2.0：标记统一按 provider 全局生效，与 profile 无关。"""
     runtime = build_runtime(
         tmp_path,
-        config={"mark_scope": "profile"},
         providers=[FakeProvider("p1")],
     )
-    run(runtime.guardian.mark("p1", reason="auth", ttl=0, profile_hint="default"))
-    assert runtime.guardian.marks() == {}
-    assert "p1" in runtime.guardian.marks_for("default")
-    assert "p1" not in runtime.guardian.marks_for("other-profile")
+    run(runtime.guardian.mark("p1", reason="auth"))
+    assert runtime.guardian.is_marked("p1") is True
     assert runtime.guardian.is_marked("p1", profile_id="default") is True
-
+    assert runtime.guardian.is_marked("p1", profile_id="other") is True
     state = runtime.guardian.export_state()
-    assert "default::p1" in state["marks_by_profile"]
+    assert "p1" in state["marks"]
+    assert "marks_by_profile" not in state
 
 
 def test_state_roundtrip(tmp_path: Path) -> None:
     runtime = build_runtime(tmp_path, providers=[FakeProvider("p1")])
-    run(runtime.guardian.mark("p1", reason="auth", ttl=0, detail="401"))
+    run(runtime.guardian.mark("p1", reason="auth", detail="401"))
     exported = runtime.guardian.export_state()
 
     fresh = build_runtime(tmp_path / "fresh", providers=[FakeProvider("p1")])
@@ -169,82 +104,158 @@ def test_state_roundtrip(tmp_path: Path) -> None:
     assert fresh.guardian.marks()["p1"].reason == "auth"
 
 
-def test_marking_disabled_by_config(tmp_path: Path) -> None:
+def test_marking_disabled_when_plugin_disabled(tmp_path: Path) -> None:
+    """总开关关闭时不写标记。"""
     runtime = build_runtime(
         tmp_path,
-        config={"enable_marking": False},
+        config={"enable": False},
         providers=[FakeProvider("p1")],
     )
-    assert run(runtime.guardian.mark("p1", reason="auth", ttl=0)) is False
+    assert run(runtime.guardian.mark("p1", reason="auth")) is False
     assert runtime.guardian.has_marked() is False
 
 
 # ---------------------------------------------------------------------------
-# 第 2 轮修复：P1-1 / P2-9 / P2-11
+# 验证与恢复（连续成功 N 次）
 # ---------------------------------------------------------------------------
 
 
-def test_switch_scope_keeps_bypass(tmp_path: Path) -> None:
-    """global → profile 切换后，既有全局标记仍然生效（P1-1）。"""
+def test_probe_success_resets_counter_on_failure(tmp_path: Path) -> None:
+    """验证失败 → 连续成功计数归零，继续等待。"""
+
+    class _FlakyProvider(FakeProvider):
+        """第一次成功，之后一直失败。"""
+
+        def __init__(self) -> None:
+            super().__init__("p1")
+            self.calls_count = 0
+
+        async def text_chat(self, **kwargs):  # type: ignore[override]
+            self.call_count += 1
+            self.calls.append(dict(kwargs))
+            if self.call_count == 1:
+                return FakeResponse("ok")
+            raise StatusError("still down", 500)
+
+    provider = _FlakyProvider()
     runtime = build_runtime(
         tmp_path,
-        config={"mark_scope": "global"},
-        providers=[FakeProvider("p1")],
+        config={"probe_success_threshold": 2},
+        providers=[provider],
     )
-    run(runtime.guardian.mark("p1", reason="auth", ttl=0))
+    run(runtime.guardian.mark("p1", reason="server_error"))
+    # 先成功一次
+    run(runtime.guardian.probe_now("p1"))
+    assert runtime.guardian.marks()["p1"].consecutive_success == 1
+    # 再失败一次 → 归零（仍未达到阈值，标记保留）
+    run(runtime.guardian.probe_now("p1"))
+    assert runtime.guardian.marks()["p1"].consecutive_success == 0
     assert runtime.guardian.is_marked("p1") is True
 
-    runtime.config["mark_scope"] = "profile"
-    assert runtime.guardian.is_marked("p1", profile_id="default") is True
-    assert "p1" in runtime.guardian.marks_for("default")
 
-    # profile 模式写入的标记，切回 global 后仍对该 profile 生效
-    run(runtime.guardian.mark("p2", reason="auth", ttl=0, profile_hint="uuid-x"))
-    runtime.config["mark_scope"] = "global"
-    assert runtime.guardian.is_marked("p2", profile_id="uuid-x") is True
-    assert runtime.guardian.is_marked("p2", profile_id="other") is False
-
-
-def test_profile_marks_listed_in_all_marks(tmp_path: Path) -> None:
+def test_probe_unmarks_after_threshold_consecutive_successes(tmp_path: Path) -> None:
+    """连续成功达到阈值 → 解除标记。"""
+    provider = FakeProvider("p1", results=[None])
     runtime = build_runtime(
         tmp_path,
-        config={"mark_scope": "profile"},
-        providers=[FakeProvider("p1"), FakeProvider("p2")],
+        config={"probe_success_threshold": 2},
+        providers=[provider],
     )
-    run(runtime.guardian.mark("p1", reason="auth", ttl=0, profile_hint="default"))
-    run(runtime.guardian.mark("p2", reason="rate_limit", ttl=60))
+    run(runtime.guardian.mark("p1", reason="server_error"))
 
-    all_marks = runtime.guardian.all_marks()
-    keys = set(all_marks)
-    assert "default::p1" in keys
-    # profile 模式下未指定 profile 的手动标记落在通配作用域 "*"（对所有配置文件生效）
-    assert "*::p2" in keys
-    assert set(runtime.guardian.mark_index()) == {"p1", "p2"}
-    snapshot = runtime.guardian.snapshot()
-    assert len(snapshot["marked"]) == 2
-
-
-def test_ttl_expires_when_probe_disabled(tmp_path: Path) -> None:
-    """enable_probe=false 时 TTL 仍然会到期解除（P2-9）。"""
-    runtime = build_runtime(
-        tmp_path,
-        config={"enable_probe": False, "mark_ttl_network": 5},
-        providers=[FakeProvider("p1")],
-    )
-    run(runtime.guardian.mark("p1", reason="network", ttl=5))
+    first = run(runtime.guardian.probe_now("p1"))
+    assert first.ok is True
+    assert first.state_after == "confirming:1/2"
     assert runtime.guardian.is_marked("p1") is True
 
-    runtime.clock.advance(60)
-    assert run(runtime.guardian.tick()) == []
+    second = run(runtime.guardian.probe_now("p1"))
+    assert second.state_after == "healthy"
+    assert runtime.guardian.is_marked("p1") is False
+    assert runtime.guardian.has_marked() is False
+
+
+def test_probe_threshold_one_unmarks_immediately(tmp_path: Path) -> None:
+    """阈值 = 1 时一次成功即解除。"""
+    provider = FakeProvider("p1", results=[None])
+    runtime = build_runtime(
+        tmp_path,
+        config={"probe_success_threshold": 1},
+        providers=[provider],
+    )
+    run(runtime.guardian.mark("p1", reason="server_error"))
+    result = run(runtime.guardian.probe_now("p1"))
+    assert result.state_after == "healthy"
     assert runtime.guardian.is_marked("p1") is False
 
 
-def test_supervisor_starts_for_ttl_only_when_probe_disabled(tmp_path: Path) -> None:
-    runtime = build_runtime(
-        tmp_path,
-        config={"enable_probe": False},
-        providers=[FakeProvider("p1")],
-    )
+def test_probe_bypasses_wrapper(tmp_path: Path) -> None:
+    """验证走类级实现，绕过包装层（不会「验证 → 标记 → 再验证」递归）。"""
+    provider = FakeProvider("p1", results=[None])
+    runtime = build_runtime(tmp_path, providers=[provider])
+    run(runtime.guardian.mark("p1", reason="server_error"))
+    result = run(runtime.guardian.probe_now("p1"))
+    assert result.ok is True
+    assert result.mode in ("text_chat", "test")
+
+
+def test_tick_dispatches_due_probe(tmp_path: Path) -> None:
+    """supervisor 会给到期的模型派发验证。
+
+    注意：``mark()`` 现在会启动 supervisor（任务包 16 的 P1 修复），
+    所以验证可能由 supervisor 自己派发；这里断言「确实发出了验证请求」，
+    而不是「由哪一方派发」。
+    """
+
+    async def _scenario() -> None:
+        provider = FakeProvider("p1", results=[None])
+        runtime = build_runtime(tmp_path, providers=[provider])
+        await runtime.guardian.mark("p1", reason="server_error")
+
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if provider.probe_call_count >= 1:
+                break
+        assert provider.probe_call_count >= 1, "应当发出过一次验证请求"
+        # 默认阈值 2：首次成功还不够，仍算被标记
+        assert runtime.guardian.is_marked("p1") is True
+        await runtime.guardian.shutdown()
+
+    run(_scenario())
+
+
+def test_tick_respects_probe_interval(tmp_path: Path) -> None:
+    """验证过一次后，没到间隔就不再派发。
+
+    这里**不启动 supervisor**（直接操作标记块），以便精确断言间隔行为 ——
+    supervisor 抢跑会让「谁派发的」变得不确定。
+    """
+
+    async def _scenario() -> None:
+        provider = FakeProvider("p1", results=[None])
+        runtime = build_runtime(
+            tmp_path,
+            config={"probe_interval_seconds": 60},
+            providers=[provider],
+        )
+        await runtime.guardian.mark("p1", reason="server_error")
+        # 停掉 supervisor，只手动驱动 tick。
+        await runtime.guardian.shutdown()
+        runtime.guardian._stopping = False
+        runtime.guardian._supervisor_task = None
+
+        # 第一次验证成功 → 连续成功计数 1，下次验证排到 60 秒后
+        await runtime.guardian.probe_now("p1")
+        runtime.clock.advance(10)
+        assert await runtime.guardian.tick() == []
+        runtime.clock.advance(60)
+        assert await runtime.guardian.tick() == ["p1"]
+
+    run(_scenario())
+
+
+def test_supervisor_not_started_without_marks(tmp_path: Path) -> None:
+    """没有被标记的模型时不必起 supervisor。"""
+    runtime = build_runtime(tmp_path, providers=[FakeProvider("p1")])
 
     async def _start() -> bool:
         await runtime.guardian.ensure_started()
@@ -252,52 +263,16 @@ def test_supervisor_starts_for_ttl_only_when_probe_disabled(tmp_path: Path) -> N
         await runtime.guardian.shutdown()
         return running
 
-    # 没有会过期的标记：不必起 supervisor
     assert run(_start()) is False
 
-    run(runtime.guardian.mark("p1", reason="rate_limit", ttl=60))
-    # 上一段 shutdown 已置位停止标志，这里重置后再验证
-    runtime.guardian._stopping = False
-    runtime.guardian._supervisor_task = None
-    assert run(_start()) is True
 
-
-def test_stats_retention_days_from_config(tmp_path: Path) -> None:
-    """``stats_retention_days`` 真正接到清理逻辑（P2-11）。"""
-    from astrbot_plugin_llm_model_guard.core.models import AttemptRecord
-
-    runtime = build_runtime(
-        tmp_path,
-        config={"stats_retention_days": 1, "enable_probe": False},
-        providers=[FakeProvider("p1")],
-    )
-    runtime.metrics.record_attempt(
-        AttemptRecord(ts=runtime.clock.now, used="ghost", ok=True, total_ms=10)
-    )
-    runtime.clock.advance(2 * 86400)
-    run(runtime.guardian.tick())
-    assert "ghost" not in runtime.metrics.per_provider()
-
-    # 0 表示永久保留
-    keep_runtime = build_runtime(
-        tmp_path / "keep",
-        config={"stats_retention_days": 0, "enable_probe": False},
-        providers=[FakeProvider("p1")],
-    )
-    keep_runtime.metrics.record_attempt(
-        AttemptRecord(ts=keep_runtime.clock.now, used="ghost", ok=True, total_ms=10)
-    )
-    keep_runtime.clock.advance(30 * 86400)
-    run(keep_runtime.guardian.tick())
-    assert "ghost" in keep_runtime.metrics.per_provider()
+# ---------------------------------------------------------------------------
+# 落盘
+# ---------------------------------------------------------------------------
 
 
 def test_flush_without_stats_when_disabled(tmp_path: Path) -> None:
-    """总开关关闭时 terminate 只写既有标记，不写统计（P3-11）。"""
-    import json
-
-    from astrbot_plugin_llm_model_guard.core.models import AttemptRecord
-
+    """总开关关闭时 terminate 只写既有标记，不写统计。"""
     runtime = build_runtime(
         tmp_path,
         config={"enable": False},
@@ -305,7 +280,7 @@ def test_flush_without_stats_when_disabled(tmp_path: Path) -> None:
     )
     runtime.guardian.load_state(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "marks": {"p1": {"state": "marked", "reason": "auth"}},
         }
     )
@@ -317,3 +292,4 @@ def test_flush_without_stats_when_disabled(tmp_path: Path) -> None:
     assert "p1" in data["marks"]
     assert data["providers"] == {}
     assert data["recent_events"] == []
+    assert data["schema_version"] == 2
