@@ -1,0 +1,379 @@
+{
+  "enable": {
+    "type": "bool",
+    "description": "启用 LLM 模型守护",
+    "hint": "关闭后插件不介入任何模型选择、重试、降级与测活，只保留只读监控页面。",
+    "default": true
+  },
+  "enable_routing": {
+    "type": "bool",
+    "description": "按配置文件接管模型选择",
+    "hint": "开启后按下方“路由”决定每个配置文件用哪个主模型；关闭后完全沿用 AstrBot 自身的选择逻辑。",
+    "default": true
+  },
+  "enable_retry": {
+    "type": "bool",
+    "description": "启用同模型重试",
+    "hint": "对可重试错误按指数退避重试同一模型。",
+    "default": true
+  },
+  "enable_fallback": {
+    "type": "bool",
+    "description": "启用降级",
+    "hint": "主模型不可用时按回退链切换模型。",
+    "default": true
+  },
+  "enable_marking": {
+    "type": "bool",
+    "description": "启用临时标记",
+    "hint": "判定需要回退时把报错模型临时标记，后续请求直接绕过；关闭则只做单次降级。",
+    "default": true
+  },
+  "enable_probe": {
+    "type": "bool",
+    "description": "启用自动测活",
+    "hint": "对已标记模型按间隔发送一次最小请求，成功则按双击确认规则解除标记。",
+    "default": true
+  },
+  "enable_monitoring": {
+    "type": "bool",
+    "description": "启用调用统计",
+    "hint": "统计调用次数、成功率、错误分类、延迟与最近错误。",
+    "default": true
+  },
+  "unmanaged_monitoring": {
+    "type": "bool",
+    "description": "统计未纳管的模型调用",
+    "hint": "没有匹配到路由的配置文件，其模型调用是否也计入统计。",
+    "default": true
+  },
+  "respect_manual_selection": {
+    "type": "bool",
+    "description": "尊重手动选择的模型",
+    "hint": "WebChat 等入口手动指定的模型优先于路由；该模型被标记时才绕过。",
+    "default": true
+  },
+  "respect_session_selection": {
+    "type": "bool",
+    "description": "尊重会话级模型切换",
+    "hint": "用户为单个会话切换过模型时优先保留。它和上一项在 AstrBot 里同源（事件上的 selected_provider），任一开启即尊重该选择。",
+    "default": true
+  },
+  "mark_scope": {
+    "type": "string",
+    "description": "标记作用域",
+    "hint": "global：同一模型在所有配置文件一起绕过；profile：仅在该配置文件内绕过。",
+    "default": "global",
+    "options": ["global", "profile"]
+  },
+  "routes": {
+    "type": "template_list",
+    "description": "路由（每个配置文件一条）",
+    "hint": "profile_id 填 default 或配置文件 UUID；留空或填 * 表示兜底路由。未匹配到路由且没有兜底路由时，插件不接管选择。",
+    "templates": {
+      "route": {
+        "name": "路由",
+        "hint": "为某个配置文件指定主模型与有序回退链",
+        "items": {
+          "profile_id": {
+            "type": "string",
+            "description": "配置文件 ID",
+            "hint": "default 或配置文件 UUID；* 或留空表示兜底路由。",
+            "default": ""
+          },
+          "primary": {
+            "type": "string",
+            "description": "主模型（provider ID）",
+            "hint": "必须与 WebUI 中“服务提供商”的 ID 完全一致。",
+            "default": ""
+          },
+          "fallbacks": {
+            "type": "list",
+            "description": "回退模型（按顺序）",
+            "hint": "主模型不可用时依次尝试；重复项与主模型会被自动忽略。",
+            "default": []
+          },
+          "max_retries": {
+            "type": "int",
+            "description": "本路由重试次数",
+            "hint": "-1 表示继承全局设置。",
+            "default": -1
+          },
+          "probe_interval_seconds": {
+            "type": "int",
+            "description": "本路由测活间隔（秒）",
+            "hint": "-1 表示继承全局设置。",
+            "default": -1
+          },
+          "probe_timeout_seconds": {
+            "type": "int",
+            "description": "本路由测活超时（秒）",
+            "hint": "-1 表示继承全局设置。",
+            "default": -1
+          },
+          "enable": {
+            "type": "bool",
+            "description": "启用此路由",
+            "hint": "关闭后该配置文件回到未纳管状态。",
+            "default": true
+          },
+          "note": {
+            "type": "string",
+            "description": "备注",
+            "hint": "仅用于说明，不影响行为。",
+            "default": ""
+          }
+        }
+      }
+    },
+    "default": []
+  },
+  "disabled_profiles": {
+    "type": "list",
+    "description": "不接管选择的配置文件",
+    "hint": "填写 default 或配置文件 UUID；这些配置文件仍会被统计，但不做选择/重试/降级。",
+    "default": []
+  },
+  "union_framework_fallbacks": {
+    "type": "bool",
+    "description": "并入 AstrBot 自身的回退模型",
+    "hint": "开启后插件回退链会追加该配置文件 provider_settings.fallback_chat_models 中的模型，避免两套回退互相重复。",
+    "default": true
+  },
+  "allow_cross_provider_switch_mid_run": {
+    "type": "bool",
+    "description": "允许工具循环中途跨模型降级",
+    "hint": "默认关闭：已产生工具调用的后续请求只重试原模型，避免 tool_call 标识与工具集不兼容。",
+    "default": false
+  },
+  "max_retries_per_model": {
+    "type": "int",
+    "description": "单模型最大重试次数",
+    "hint": "不含首次尝试。0 表示不重试。默认 1：AstrBot 的 OpenAI 兼容 provider 自身最多已重试 10 次，插件再叠加会放大请求量，所以默认只补一次。",
+    "default": 1,
+    "slider": {
+      "min": 0,
+      "max": 5,
+      "step": 1
+    }
+  },
+  "retry_backoff_base": {
+    "type": "float",
+    "description": "退避起始秒数",
+    "hint": "第 n 次重试等待 base * factor^(n-1)，再叠加抖动。",
+    "default": 0.5
+  },
+  "retry_backoff_factor": {
+    "type": "float",
+    "description": "退避倍率",
+    "default": 2.0
+  },
+  "retry_backoff_max": {
+    "type": "float",
+    "description": "单次退避上限（秒）",
+    "default": 8.0
+  },
+  "retry_jitter_ratio": {
+    "type": "float",
+    "description": "退避抖动比例",
+    "hint": "0.2 表示实际等待时间上下浮动 20%。",
+    "default": 0.2
+  },
+  "retry_total_timeout": {
+    "type": "float",
+    "description": "单次调用总重试预算（秒）",
+    "hint": "超预算立即放弃重试并按分类处理，避免用户长时间等待。",
+    "default": 30.0
+  },
+  "retry_budget_per_umo_per_minute": {
+    "type": "int",
+    "description": "单会话每分钟重试上限",
+    "hint": "防止大面积故障时重试放大请求量；0 表示不限制。",
+    "default": 20
+  },
+  "retry_empty_output": {
+    "type": "bool",
+    "description": "空输出重试",
+    "hint": "模型返回空内容时是否由插件按同模型重试。默认关闭：AstrBot 自带 tenacity 重试（最多 3 次/候选），插件再重试会让单候选最坏被请求 9 次。",
+    "default": false
+  },
+  "mark_on_empty_output_after": {
+    "type": "int",
+    "description": "连续空输出多少次才标记",
+    "hint": "0 表示永不因空输出标记。",
+    "default": 3
+  },
+  "mark_ttl_default": {
+    "type": "int",
+    "description": "默认标记时长（秒）",
+    "hint": "0 表示不过期，只能靠测活成功或手动解除。注意：流式响应一旦已经输出内容后中断，不会写标记（只记统计），因此不会把流式中断当成模型故障。",
+    "default": 0
+  },
+  "mark_ttl_rate_limit": {
+    "type": "int",
+    "description": "限流类标记时长（秒）",
+    "default": 300
+  },
+  "mark_ttl_server_error": {
+    "type": "int",
+    "description": "服务端错误类标记时长（秒）",
+    "default": 300
+  },
+  "mark_ttl_network": {
+    "type": "int",
+    "description": "网络类标记时长（秒）",
+    "default": 120
+  },
+  "double_confirm": {
+    "type": "bool",
+    "description": "双击确认",
+    "hint": "开启后测活成功还需等待一段时间并再成功一次才解除标记。",
+    "default": true
+  },
+  "confirm_delay_seconds": {
+    "type": "int",
+    "description": "两次测活间隔（秒）",
+    "hint": "双击确认开启时生效。",
+    "default": 60
+  },
+  "probe_interval_seconds": {
+    "type": "int",
+    "description": "测活间隔（秒）",
+    "default": 120
+  },
+  "probe_timeout_seconds": {
+    "type": "float",
+    "description": "测活超时（秒）",
+    "hint": "AstrBot 自身默认 45 秒，这里默认更短以便尽快判定。",
+    "default": 30.0
+  },
+  "probe_max_concurrency": {
+    "type": "int",
+    "description": "测活最大并发",
+    "default": 2,
+    "slider": {
+      "min": 1,
+      "max": 8,
+      "step": 1
+    }
+  },
+  "probe_skip_when_busy": {
+    "type": "bool",
+    "description": "模型忙碌时跳过测活",
+    "hint": "避免测活与真实对话抢占限流额度。",
+    "default": true
+  },
+  "probe_tick_seconds": {
+    "type": "int",
+    "description": "测活调度扫描间隔（秒）",
+    "default": 5
+  },
+  "probe_on_startup": {
+    "type": "bool",
+    "description": "启动时立即测活一次",
+    "hint": "插件启动后对已标记模型立刻测活，缩短恢复时间。",
+    "default": true
+  },
+  "stats_window_seconds": {
+    "type": "int",
+    "description": "延迟统计窗口（秒）",
+    "hint": "p50/p95 只统计该时间窗口内的调用。",
+    "default": 900
+  },
+  "stats_recent_events": {
+    "type": "int",
+    "description": "保留最近调用记录条数",
+    "default": 200
+  },
+  "stats_persist_interval_seconds": {
+    "type": "int",
+    "description": "状态落盘间隔（秒）",
+    "hint": "标记变更会立即落盘；统计聚合按此间隔落盘。",
+    "default": 30
+  },
+  "stats_retention_days": {
+    "type": "int",
+    "description": "统计保留期（天）",
+    "hint": "仍然存在的服务提供商会一直保留统计；已从配置里删除的模型按此天数清理。0 表示永久保留。",
+    "default": 7
+  },
+  "error_rules": {
+    "type": "template_list",
+    "description": "自定义错误分类规则",
+    "hint": "优先级数字越小越先匹配；内置规则的优先级是 10–55，填比它更小的数字即可抢在内置规则之前命中。",
+    "templates": {
+      "rule": {
+        "name": "分类规则",
+        "hint": "把特定错误映射到某个处理动作",
+        "items": {
+          "id": {
+            "type": "string",
+            "description": "规则 ID",
+            "hint": "用于日志与页面展示，建议唯一。",
+            "default": ""
+          },
+          "enabled": {
+            "type": "bool",
+            "description": "启用",
+            "default": true
+          },
+          "priority": {
+            "type": "int",
+            "description": "优先级",
+            "hint": "升序匹配；内置规则是 10–55，小于它们会先匹配。",
+            "default": 10
+          },
+          "match_status": {
+            "type": "list",
+            "description": "匹配 HTTP 状态码",
+            "hint": "整数列表；留空表示不限制状态码。",
+            "default": []
+          },
+          "match_exc_regex": {
+            "type": "string",
+            "description": "匹配异常类名正则",
+            "hint": "对 type(exc).__name__ 做 search；留空表示不限制。",
+            "default": ""
+          },
+          "match_msg_regex": {
+            "type": "string",
+            "description": "匹配错误消息正则",
+            "hint": "对 str(exc) 做 search（忽略大小写）；留空表示不限制。",
+            "default": ""
+          },
+          "action": {
+            "type": "string",
+            "description": "处理动作",
+            "hint": "retry_same 重试同一模型；fallback 直接降级；mark 标记；mark_and_fallback 标记并降级；surface 直接上抛；ignore 不介入。",
+            "default": "mark_and_fallback",
+            "options": ["retry_same", "fallback", "mark", "mark_and_fallback", "surface", "ignore"]
+          },
+          "mark_ttl_seconds": {
+            "type": "int",
+            "description": "标记时长（秒）",
+            "hint": "0 表示不过期。",
+            "default": 0
+          },
+          "note": {
+            "type": "string",
+            "description": "备注",
+            "default": ""
+          }
+        }
+      }
+    },
+    "default": []
+  },
+  "allow_webui_actions": {
+    "type": "bool",
+    "description": "允许页面执行写操作",
+    "hint": "默认关闭，页面只读。开启后任何已登录 AstrBot 面板的用户都能解除标记或触发测活。",
+    "default": false
+  },
+  "log_level": {
+    "type": "string",
+    "description": "日志级别",
+    "default": "info",
+    "options": ["error", "warning", "info", "debug"]
+  }
+}

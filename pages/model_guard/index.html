@@ -1,0 +1,152 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LLM 模型守护 · 监控</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<div class="lm-page">
+
+  <header class="lm-topbar">
+    <div class="lm-brand">
+      <h1>LLM 模型守护</h1>
+      <span class="lm-badge lm-badge--mute" id="lmEnableBadge">状态未知</span>
+      <p class="lm-sub" id="lmConfigSummary">
+        <span>测活间隔 —</span><span>测活超时 —</span><span>二次确认 —</span><span>上次刷新 —</span>
+      </p>
+    </div>
+    <div class="lm-toolbar">
+      <label class="lm-field" for="lmAutoToggle">
+        <input type="checkbox" id="lmAutoToggle" checked> 自动刷新
+      </label>
+      <label class="lm-field" for="lmIntervalSelect">
+        间隔
+        <select id="lmIntervalSelect">
+          <option value="5000">5 秒</option>
+          <option value="15000" selected>15 秒</option>
+          <option value="30000">30 秒</option>
+          <option value="60000">60 秒</option>
+        </select>
+      </label>
+      <button type="button" class="lm-btn" id="lmRefreshBtn">立即刷新</button>
+      <button type="button" class="lm-btn lm-btn--warn" id="lmReloadBtn" hidden>重载配置</button>
+    </div>
+  </header>
+
+  <div class="lm-banners" id="lmBanners" role="status" aria-live="polite"></div>
+
+  <section class="lm-cards" id="lmCards" aria-label="总览">
+    <div class="lm-card">
+      <div class="lm-card-label">调用总数</div>
+      <div class="lm-card-value">—</div>
+      <div class="lm-card-note">等待数据</div>
+    </div>
+    <div class="lm-card">
+      <div class="lm-card-label">错误总数</div>
+      <div class="lm-card-value">—</div>
+      <div class="lm-card-note">等待数据</div>
+    </div>
+    <div class="lm-card">
+      <div class="lm-card-label">成功率</div>
+      <div class="lm-card-value">—</div>
+      <div class="lm-card-note">等待数据</div>
+    </div>
+    <div class="lm-card">
+      <div class="lm-card-label">已标记模型</div>
+      <div class="lm-card-value">—</div>
+      <div class="lm-card-note">等待数据</div>
+    </div>
+  </section>
+
+  <section class="lm-panel" aria-labelledby="lmRoutesTitle">
+    <div class="lm-panel-head">
+      <h2 id="lmRoutesTitle">模型路由 <span class="lm-count" id="lmRoutesCount">—</span></h2>
+      <div class="lm-panel-tools">
+        <span class="lm-hint" id="lmRoutesHint"></span>
+      </div>
+    </div>
+    <div class="lm-panel-body" id="lmRoutesWrap">
+      <div class="lm-empty">正在连接 AstrBot 页面桥接…</div>
+    </div>
+  </section>
+
+  <section class="lm-panel" aria-labelledby="lmProvidersTitle">
+    <div class="lm-panel-head">
+      <h2 id="lmProvidersTitle">模型调用统计 <span class="lm-count" id="lmProvidersCount">—</span></h2>
+      <div class="lm-panel-tools">
+        <input type="search" class="lm-input" id="lmProviderFilter" placeholder="按模型 ID 筛选" aria-label="按模型 ID 筛选">
+        <button type="button" class="lm-btn lm-btn--sm" id="lmSortErrors" aria-pressed="true">按错误数</button>
+        <button type="button" class="lm-btn lm-btn--sm" id="lmSortLatency" aria-pressed="false">按延迟</button>
+      </div>
+    </div>
+    <div class="lm-panel-body">
+      <p class="lm-hint" id="lmActionHint" hidden></p>
+      <div id="lmProvidersWrap">
+        <div class="lm-empty">正在连接 AstrBot 页面桥接…</div>
+      </div>
+    </div>
+  </section>
+
+  <section class="lm-panel" aria-labelledby="lmMarksTitle">
+    <div class="lm-panel-head">
+      <h2 id="lmMarksTitle">标记详情 <span class="lm-count" id="lmMarksCount">—</span></h2>
+      <div class="lm-panel-tools">
+        <span class="lm-hint" id="lmMarksHint"></span>
+      </div>
+    </div>
+    <div class="lm-panel-body" id="lmMarksWrap">
+      <div class="lm-empty">正在连接 AstrBot 页面桥接…</div>
+    </div>
+  </section>
+
+  <section class="lm-panel" id="lmEventsPanel" aria-labelledby="lmEventsTitle" hidden>
+    <div class="lm-panel-head">
+      <h2 id="lmEventsTitle">最近事件 <span class="lm-count" id="lmEventsCount">—</span></h2>
+      <div class="lm-panel-tools">
+        <label class="lm-field" for="lmEventProviderFilter">
+          模型
+          <select id="lmEventProviderFilter">
+            <option value="">全部</option>
+          </select>
+        </label>
+      </div>
+    </div>
+    <div class="lm-panel-body" id="lmEventsWrap"></div>
+  </section>
+
+</div>
+
+<div class="lm-toast-layer" id="lmToastLayer" aria-live="polite" aria-atomic="false"></div>
+
+<div class="lm-modal" id="lmModal" role="dialog" aria-modal="true" aria-labelledby="lmModalTitle" hidden>
+  <div class="lm-modal-card">
+    <h3 id="lmModalTitle">标记模型</h3>
+    <p class="lm-modal-desc" id="lmModalDesc"></p>
+    <div id="lmMarkFields">
+      <div class="lm-form-row">
+        <label for="lmMarkReason">标记原因（可选，便于回溯）</label>
+        <input type="text" class="lm-input" id="lmMarkReason" maxlength="200" placeholder="例如：手动排查，key 疑似失效">
+      </div>
+      <div class="lm-form-row">
+        <label for="lmMarkTtl">标记时长秒数（可选，留空表示使用默认/不自动解除）</label>
+        <input type="number" class="lm-input" id="lmMarkTtl" min="1" step="1" placeholder="例如 600">
+      </div>
+    </div>
+    <div class="lm-modal-actions">
+      <button type="button" class="lm-btn" id="lmModalCancel">取消</button>
+      <button type="button" class="lm-btn lm-btn--primary" id="lmModalConfirm">确认</button>
+    </div>
+  </div>
+</div>
+
+<noscript>
+  <div class="lm-page">
+    <div class="lm-banner lm-banner--error"><strong>需要 JavaScript</strong>此页面依赖原生 JavaScript 与 AstrBot 页面桥接，请启用 JavaScript 后刷新。</div>
+  </div>
+</noscript>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>
