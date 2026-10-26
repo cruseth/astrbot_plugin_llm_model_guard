@@ -165,24 +165,50 @@ def test_full_recovery_loop_returns_model_to_chain(tmp_path: Path) -> None:
 
 
 def test_supervisor_tick_dispatches_probe_after_auto_mark(tmp_path: Path) -> None:
-    """supervisor 会给被自动标记的模型派发验证（自动标记后闭环真的在跑）。"""
+    """supervisor 会给被自动标记的模型派发验证（自动标记后闭环真的在跑）。
+
+    **断言必须看 ``probe_call_count`` 而不是 ``call_count``**：
+    前面的 401 对话调用已经把 ``call_count`` 涨到了 1，用它断言的话，
+    即使 supervisor 一次都没派发验证，断言也会通过（假绿）。
+    ``probe_call_count`` 只统计带 ``PROBE_PROMPT`` 的验证请求，才能证明
+    「确实是 supervisor 派出去的验证」。
+
+    基线要在**自动标记之前**取：supervisor 一旦被 ``mark()`` 拉起来就可能
+    立刻派发验证，那样基线就不再是 0。
+    """
 
     async def _scenario() -> None:
         runtime, p1, _ = _runtime(tmp_path)
 
+        # 基线：还没有任何标记，supervisor 没跑，probe 计数应为 0
+        baseline = p1.probe_call_count
+        assert baseline == 0, "还没标记时不应有验证请求"
+        assert runtime.guardian.supervisor_running is False
+
+        # 触发自动标记 → mark() 会拉起 supervisor
         await runtime.guard.handle_text_chat(p1, (), {"prompt": "hi", "session_id": UMO})
+        assert runtime.guardian.is_marked("p1") is True
         assert runtime.guardian.supervisor_running is True
 
-        # supervisor 已经在后台跑起来了：等它自己派发验证。
+        # 等 supervisor 在后台派发验证
         p1.results = [None]
         for _ in range(50):
             await asyncio.sleep(0.01)
-            if p1.call_count >= 1:
+            if p1.probe_call_count > baseline:
                 break
-        assert p1.call_count >= 1, "supervisor 应当自动给被标记的模型派发验证"
+        if p1.probe_call_count <= baseline:
+            # 后台 supervisor 还没轮到，手动驱动一次 tick
+            await runtime.guardian.tick()
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                if p1.probe_call_count > baseline:
+                    break
 
-        # 明确再调一次 tick 也不会重复派发同一个模型（已在飞行中）。
-        await runtime.guardian.tick()
+        # 关键断言：相对基线**增长**了 —— 说明确实发出了验证请求
+        assert p1.probe_call_count > baseline, (
+            "supervisor 应当给被自动标记的模型派发验证请求"
+            f"（基线 {baseline}，实际 {p1.probe_call_count}）"
+        )
 
         await runtime.guardian.shutdown()
 
