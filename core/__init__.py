@@ -11,7 +11,8 @@
 * :mod:`core.store`：``state.json`` 原子读写与迁移；
 * :mod:`core.metrics`：调用统计聚合；
 * :mod:`core.commands`：管理员命令的文本渲染与解析；
-* :mod:`core.web_api`：Web API 视图。
+* :mod:`core.web_api`：Web API 视图；
+* :mod:`core.schema_sync`：把框架配置文件动态注入 schema 的 options/labels。
 
 除 ``main.py`` 外，任何模块都不得直接访问 ``context``。
 """
@@ -26,6 +27,7 @@ __all__ = [
     "models",
     "registry",
     "routing",
+    "schema_sync",
     "store",
     "web_api",
     "wrapper",

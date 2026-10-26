@@ -69,11 +69,12 @@
   "routes": {
     "type": "template_list",
     "description": "路由（每个配置文件一条）",
-    "hint": "profile_id 填 default 或配置文件 UUID；留空或填 * 表示兜底路由。未匹配到路由且没有兜底路由时，插件不接管选择。",
+    "hint": "主模型与回退链用下拉选择，不再手填 provider id。profile_id 填 default 或配置文件 UUID；留空或填 * 表示兜底路由。未匹配到路由且没有兜底路由时，插件不接管选择。",
     "templates": {
       "route": {
         "name": "路由",
         "hint": "为某个配置文件指定主模型与有序回退链",
+        "display_item": "profile_id",
         "items": {
           "profile_id": {
             "type": "string",
@@ -84,14 +85,17 @@
           "primary": {
             "type": "string",
             "description": "主模型（provider ID）",
-            "hint": "必须与 WebUI 中“服务提供商”的 ID 完全一致。",
-            "default": ""
+            "hint": "点右侧按钮从“服务提供商”里选；必须是聊天补全类型的模型。",
+            "default": "",
+            "_special": "select_provider"
           },
           "fallbacks": {
             "type": "list",
             "description": "回退模型（按顺序）",
-            "hint": "主模型不可用时依次尝试；重复项与主模型会被自动忽略。",
-            "default": []
+            "hint": "主模型不可用时依次尝试；可多选并用上下箭头调整顺序。重复项与主模型会被自动忽略。",
+            "default": [],
+            "items": {"type": "string"},
+            "_special": "select_providers"
           },
           "max_retries": {
             "type": "int",
@@ -128,10 +132,84 @@
     },
     "default": []
   },
+  "profiles": {
+    "type": "template_list",
+    "description": "配置文件路由（按名称选择配置文件）",
+    "hint": "推荐用这一项：profile 可以直接填“配置文件名”，插件会自动解析成框架里的 id；也可以填 id 或 id 的唯一前缀。与下方“路由”指向同一个配置文件时，以“路由”为准。",
+    "templates": {
+      "profile_route": {
+        "name": "配置文件路由",
+        "hint": "为某个配置文件指定主模型与有序回退链；配置文件名在插件页面“配置文件”区可见",
+        "display_item": "profile",
+        "items": {
+          "profile": {
+            "type": "string",
+            "description": "配置文件",
+            "hint": "填配置文件名（推荐）或 id；留空表示兜底路由。同名配置文件无法区分时插件会拒绝接管并告警。",
+            "default": ""
+          },
+          "primary": {
+            "type": "string",
+            "description": "主模型（provider ID）",
+            "hint": "点右侧按钮从“服务提供商”里选；必须是聊天补全类型的模型。",
+            "default": "",
+            "_special": "select_provider"
+          },
+          "fallbacks": {
+            "type": "list",
+            "description": "回退模型（按顺序）",
+            "hint": "主模型不可用时依次尝试；可多选并用上下箭头调整顺序。重复项与主模型会被自动忽略。",
+            "default": [],
+            "items": {"type": "string"},
+            "_special": "select_providers"
+          },
+          "max_retries": {
+            "type": "int",
+            "description": "本路由重试次数",
+            "hint": "-1 表示继承全局设置。",
+            "default": -1
+          },
+          "probe_interval_seconds": {
+            "type": "int",
+            "description": "本路由测活间隔（秒）",
+            "hint": "-1 表示继承全局设置。",
+            "default": -1
+          },
+          "probe_timeout_seconds": {
+            "type": "int",
+            "description": "本路由测活超时（秒）",
+            "hint": "-1 表示继承全局设置。",
+            "default": -1
+          },
+          "enable": {
+            "type": "bool",
+            "description": "启用此路由",
+            "hint": "关闭后该配置文件回到未纳管状态。",
+            "default": true
+          },
+          "note": {
+            "type": "string",
+            "description": "备注",
+            "hint": "仅用于说明，不影响行为。",
+            "default": ""
+          }
+        }
+      }
+    },
+    "default": []
+  },
+  "fallback_pool": {
+    "type": "list",
+    "description": "公共回退池",
+    "hint": "所有路由共享的有序回退候选，排在各路由自己的回退链之后、AstrBot 自身的回退模型之前。",
+    "default": [],
+    "items": {"type": "string"},
+    "_special": "select_providers"
+  },
   "disabled_profiles": {
     "type": "list",
     "description": "不接管选择的配置文件",
-    "hint": "填写 default 或配置文件 UUID；这些配置文件仍会被统计，但不做选择/重试/降级。",
+    "hint": "填写 default、配置文件 UUID 或配置文件名；这些配置文件仍会被统计，但不做选择/重试/降级。",
     "default": []
   },
   "union_framework_fallbacks": {

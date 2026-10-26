@@ -17,7 +17,7 @@ import time
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from .models import MARK_SCOPE_PROFILE, MarkState
-from .routing import describe_route, describe_warning
+from .routing import describe_route, describe_warning, resolve_profile_ref
 
 #: 注册路由的统一前缀（必须与插件名一致）。
 ROUTE_PREFIX = "/astrbot_plugin_llm_model_guard"
@@ -27,6 +27,9 @@ ROUTE_OVERVIEW = f"{ROUTE_PREFIX}/overview"
 ROUTE_ROUTES = f"{ROUTE_PREFIX}/routes"
 ROUTE_EVENTS = f"{ROUTE_PREFIX}/events"
 ROUTE_HEALTH = f"{ROUTE_PREFIX}/health"
+ROUTE_PROFILES = f"{ROUTE_PREFIX}/profiles"
+#: 重新注入 schema 选项（幂等）；框架里新建/删除配置文件后可手动触发。
+ROUTE_SCHEMA_REFRESH = f"{ROUTE_PREFIX}/schema_refresh"
 
 #: 写端点。
 ROUTE_MARK = f"{ROUTE_PREFIX}/mark"
@@ -131,6 +134,7 @@ def collect_routes(guard: Any) -> list[dict[str, Any]]:
     settings = guard.settings
     marks = guard.guardian.mark_index()
     known_ids = guard.provider_ids()
+    names = profile_name_map(guard)
     result: list[dict[str, Any]] = []
     for profile_id, route in guard.route_table.items():
         result.append(
@@ -139,15 +143,20 @@ def collect_routes(guard: Any) -> list[dict[str, Any]]:
                 marks=marks,
                 known_ids=known_ids,
                 fallback_ids=(),
+                fallback_pool=settings.fallback_pool,
                 union_framework_fallbacks=settings.union_framework_fallbacks,
+                profile_name=names.get(profile_id),
             )
         )
     if settings.disabled_profiles:
-        for code in settings.disabled_profiles:
+        for code in sorted(settings.disabled_profiles):
             result.append(
                 {
                     "profile_id": code,
-                    "profile_name": code,
+                    "profile_name": names.get(code, code),
+                    "profile_display": (
+                        f"{names[code]} ({code})" if code in names else code
+                    ),
                     "primary": "",
                     "fallbacks": [],
                     "effective_chain": [],
@@ -166,9 +175,30 @@ def collect_routes(guard: Any) -> list[dict[str, Any]]:
     return result
 
 
+def profile_name_map(guard: Any) -> dict[str, str]:
+    """``{profile_id: 配置文件名}``；取不到名称时返回空映射。"""
+    entries = getattr(guard, "profile_entries", None) or []
+    result: dict[str, str] = {}
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        profile_id = str(entry.get("id") or "").strip()
+        if not profile_id:
+            continue
+        name = str(entry.get("name") or "").strip()
+        if name and name != profile_id:
+            result[profile_id] = name
+    return result
+
+
 def collect_profiles(guard: Any) -> list[dict[str, Any]]:
-    """所有配置文件（abconf）的 id 与名字，便于页面筛选。"""
+    """所有配置文件（abconf）的 id、名字与当前默认模型，便于页面展示与排查。
+
+    框架没有 abconf 选择器，插件用这个只读接口把「可选的配置文件」暴露给页面，
+    用户不必手抄 uuid。
+    """
     acm = guard.acm
+    known_ids = set(guard.provider_ids())
     getter = getattr(acm, "get_conf_list", None)
     profiles: list[dict[str, Any]] = []
     if callable(getter):
@@ -186,7 +216,55 @@ def collect_profiles(guard: Any) -> list[dict[str, Any]]:
             profiles = []
     if not any(item.get("profile_id") == "default" for item in profiles):
         profiles.insert(0, {"profile_id": "default", "name": "default", "path": ""})
-    return profiles
+
+    result: list[dict[str, Any]] = []
+    for item in profiles:
+        profile_id = item["profile_id"]
+        default_provider = _profile_default_provider(guard, profile_id)
+        result.append(
+            {
+                "id": profile_id,
+                "profile_id": profile_id,
+                "name": item["name"],
+                "path": item["path"],
+                "is_default": profile_id == "default",
+                "default_provider": default_provider,
+                "default_provider_exists": (
+                    default_provider in known_ids if default_provider else None
+                ),
+                "display": (
+                    f"{item['name']} ({profile_id})"
+                    if item["name"] and item["name"] != profile_id
+                    else profile_id
+                ),
+            }
+        )
+    return result
+
+
+def _profile_default_provider(guard: Any, profile_id: str) -> str:
+    """读某个配置文件当前的默认 provider（``provider_settings.default_provider_id``）。"""
+    acm = guard.acm
+    getter = getattr(acm, "get_conf", None)
+    if not callable(getter):
+        return ""
+    conf = None
+    # 框架的 ``get_conf(umo)`` 需要 umo；配置文件 id 走 ``confs`` 字典更直接。
+    confs = getattr(acm, "confs", None)
+    if isinstance(confs, Mapping) and profile_id in confs:
+        conf = confs[profile_id]
+    else:
+        try:
+            conf = getter(profile_id)
+        except Exception:
+            conf = None
+    if not isinstance(conf, Mapping):
+        return ""
+    settings_block = conf.get("provider_settings")
+    if not isinstance(settings_block, Mapping):
+        return ""
+    value = settings_block.get("default_provider_id")
+    return value.strip() if isinstance(value, str) else ""
 
 
 def build_overview(guard: Any) -> dict[str, Any]:
@@ -237,6 +315,35 @@ def build_routes(guard: Any, *, profile_id: str | None = None) -> dict[str, Any]
     if profile_id:
         routes = [item for item in routes if item.get("profile_id") == profile_id]
     return {"profiles": collect_profiles(guard), "routes": routes}
+
+
+def build_profiles(guard: Any) -> dict[str, Any]:
+    """``GET /profiles`` 的 ``data``。
+
+    返回框架的配置文件列表（id / name / path / 默认模型），以及**没能解析**
+    的路由引用（``unmatched``），让页面能明确提示「这条路由没接管任何配置文件」。
+    """
+    profiles = collect_profiles(guard)
+    entries = [
+        {"id": item["id"], "name": item["name"], "path": item["path"]}
+        for item in profiles
+    ]
+    unmatched: list[str] = []
+    for route in guard.settings.profiles:
+        ref = route.profile_ref
+        if not ref:
+            continue
+        result = resolve_profile_ref(ref, entries)
+        if not result.ok:
+            unmatched.append(ref)
+    for ref in sorted(guard.settings.disabled_profiles):
+        result = resolve_profile_ref(ref, entries)
+        if not result.ok:
+            unmatched.append(ref)
+    return {
+        "profiles": profiles,
+        "unmatched": sorted(set(unmatched)),
+    }
 
 
 def build_events(
@@ -366,6 +473,8 @@ def route_handlers() -> Sequence[tuple[str, str]]:
         (ROUTE_ROUTES, "GET"),
         (ROUTE_EVENTS, "GET"),
         (ROUTE_HEALTH, "GET"),
+        (ROUTE_PROFILES, "GET"),
+        (ROUTE_SCHEMA_REFRESH, "GET"),
         (ROUTE_MARK, "POST"),
         (ROUTE_UNMARK, "POST"),
         (ROUTE_PROBE, "POST"),

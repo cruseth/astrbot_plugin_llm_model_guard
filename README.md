@@ -49,9 +49,11 @@
 
 1. 把本目录放到 AstrBot 的 `data/plugins/astrbot_plugin_llm_model_guard/`；
 2. 重启 AstrBot（或在 WebUI 插件页启用）；
-3. 打开插件配置页填写「路由」：`profile_id` = `default` 或某个配置文件的 UUID，`primary` = 服务提供商 ID，`fallbacks` = 有序回退链。
+3. 打开插件配置页，在「配置文件路由」里新增条目：`profile` 从**下拉**里选配置文件，
+   `primary` / `fallbacks` 用**下拉**选模型（都不用手抄 id）。
 
-> 服务提供商 ID 可以先用 `/llmguard models` 查看，避免手抄错。
+> 配置文件名可以用 `/llmguard profiles` 或插件页面「配置文件」区查看；
+> 服务提供商 ID 可以用 `/llmguard models` 查看（老配置 `routes` 里手填的 id 仍然有效）。
 
 ---
 
@@ -75,12 +77,99 @@
 | 键 | 类型 | 说明 |
 | --- | --- | --- |
 | `routes` | template_list(`route`) | 每条含 `profile_id`、`primary`、`fallbacks`、`max_retries`(默认 -1 继承)、`probe_interval_seconds`(-1)、`probe_timeout_seconds`(-1)、`enable`、`note` |
-| `disabled_profiles` | list | 不接管选择的配置文件 ID |
+| `profiles` | template_list(`profile_route`) | 每条含 `profile`（配置文件**名或 id**）、`primary`、`fallbacks`、`max_retries`、`probe_interval_seconds`、`probe_timeout_seconds`、`enable`、`note` |
+| `fallback_pool` | list | 公共回退池：所有路由共享的有序回退候选 |
+| `disabled_profiles` | list | 不接管选择的配置文件（可填 id 或**名称**） |
 | `mark_scope` | string | `global`（默认，同一模型全局绕过）/ `profile`（仅该配置文件内绕过） |
 | `respect_manual_selection` | bool | 尊重 WebChat 等入口手动指定的模型 |
 | `respect_session_selection` | bool | 尊重会话级模型切换（与上一项在框架里同源，任一开启即尊重） |
 | `union_framework_fallbacks` | bool | 把 AstrBot 自身 `fallback_chat_models` 并入候选链 |
 | `allow_cross_provider_switch_mid_run` | bool | 允许工具循环中途跨模型降级（默认关闭） |
+
+#### 4.2.1 可视化选择：哪些项不用手填
+
+| 配置项 | 控件 | 说明 |
+| --- | --- | --- |
+| `routes[].primary` | 下拉（`_special: select_provider`） | 从 WebUI「服务提供商」里选**聊天补全**类型的模型 |
+| `routes[].fallbacks` | 多选 + 上下移（`_special: select_providers`） | 选中的顺序即回退顺序 |
+| `profiles[].primary` | 下拉（`_special: select_provider`） | 同上 |
+| `profiles[].fallbacks` | 多选 + 上下移（`_special: select_providers`） | 同上 |
+| `fallback_pool` | 多选 + 上下移（`_special: select_providers`） | 公共回退池 |
+| `profiles[].profile` | **动态下拉** | 框架配置文件列表，运行时注入（见 §4.2.4） |
+| `routes[].profile_id` | **动态下拉** | 同上，额外保留 `*`（兜底路由） |
+| `disabled_profiles` | **动态多选** | 同上 |
+| `error_rules[]` | 仍是文本框 | 规则只匹配 HTTP 状态码 / 异常类名 / 错误消息正则，与模型 id 无关，没有可选项 |
+
+> `select_providers` 是 AstrBot Core 的内部实现（官方文档明确标注「插件不应使用」），
+> 随时可能变动。它当前的契约是：结果为 `list[str]`、按点击顺序排列、支持上下移调整顺序，
+> 与本插件「有序回退链」的语义完全吻合。若未来框架改动导致该 `_special` 失效，
+> 受影响的是**配置界面**（控件退化成普通列表输入框），**配置数据与运行时行为不受影响**：
+> 插件读到的仍然是 `list[str]`，候选链组装逻辑不依赖框架前端。
+> 详见「§8 已知限制」。
+
+#### 4.2.2 配置文件（abconf）的填写与解析规则
+
+配置文件在配置页上是**下拉选择**（运行时动态注入，见 §4.2.4），不用手填 uuid。
+插件另外提供两个辅助手段：
+
+- **插件页面「配置文件」区**：展示框架的配置文件（名称、id、当前默认模型）；
+- **`/llmguard profiles` 命令**：列出同样的信息。
+
+无论下拉还是手填，解析规则（`core/routing.py::resolve_profile_ref`）都是**按顺序**尝试：
+
+1. **按 id 精确匹配**；
+2. **按名称精确匹配**；
+3. **按 id 的唯一前缀匹配**；
+4. 都不匹配 → **视为未配置**：不接管任何配置文件，并给出明确告警
+   （页面「配置文件」区会列出未匹配的引用）。
+
+**同名歧义**：若框架里有多个同名配置文件，插件**拒绝接管**并告警，
+不会随机挑一个。同理，`disabled_profiles` 里填了歧义名称时，该引用不生效。
+
+> 下拉里存的是**框架 id**（`default` 或 uuid），显示名是 `名称（id）`。
+> 历史配置里按**名称**填过的值仍然能解析（规则 2），不会被破坏。
+
+#### 4.2.3 `routes` 与 `profiles` 的关系与迁移
+
+两者合并成同一张路由表，**`routes` 优先**：
+
+- 旧配置（只有 `routes[].profile_id`，值是 `default` 或 uuid）**完全不受影响**，无需迁移；
+- 想改成按名称配置时，把该条从「路由」挪到「配置文件路由」，`profile` 填名称即可；
+- 同一个配置文件在两处都有配置时，以「路由」为准，另一条记重复告警但**不覆盖**。
+
+`fallback_pool` 并入候选链的位置：**路由链 → 公共回退池 → AstrBot 自身的
+`fallback_chat_models`**（三者整体去重）。公共回退池不受 `union_framework_fallbacks`
+开关影响（它属于插件自己的链）。
+
+#### 4.2.4 配置文件下拉是怎么来的（动态注入）
+
+框架的插件配置页 schema 来自 `GET /api/config/get?plugin_name=...`，后端
+（`astrbot/dashboard/routes/config.py:1607-1613`）**直接引用**插件实例持有的
+`config.schema` 对象；而 `AstrBotConfig.schema` 是普通可变 dict。
+因此插件在运行时**原地改写** `config.schema` 里对应字段的 `options` / `labels`，
+配置页就会渲染出真正动态的下拉（`type:"string"` + `options` → 下拉；
+`type:"list"` + `options` → 可搜索多选）。
+
+- 实现：`core/schema_sync.py::inject_profile_options()`；
+- 注入时机：插件初始化、`/llmguard reload`、以及 `GET /astrbot_plugin_llm_model_guard/schema_refresh`（幂等）；
+- 注入范围：`routes[].profile_id`（含 `*` 兜底项）、`profiles[].profile`、`disabled_profiles`；
+- **历史值并入**：已存配置里出现过的所有引用（名称或 id）都会并入 `options`，
+  框架里找不到的标注为 `名称（历史配置值，框架中未找到）`，
+  避免下拉显示空白、让用户以为配置丢了；
+- **失败即降级**：拿不到配置文件列表、schema 不可用时**保持原 schema 不变**，
+  配置页退化为普通文本框（仍然可用），不影响插件运行；
+- **静态 schema 不预置 `options`**：JS 里空数组是 truthy，预置空 `options` 会让控件
+  变成「没有任何选项的下拉」，注入失败时用户将完全无法输入。保持字段无 `options`，
+  注入失败才会退化成可用的文本框；
+- **两阶段提交（原子性）**：注入先做**只读预检**（定位全部目标、构造 options/labels、
+  校验长度相等），全部通过才提交。任一环节失败（`missing_target` / `length_mismatch`）
+  时**一个字段都不写**，schema 与调用前**完全相等** —— 不会出现「一部分是下拉、
+  一部分是文本框」的不一致状态；
+- **并发安全**：「预检 + 提交」全程由模块级 `threading.RLock` 保护，
+  防止两个线程交叉写入导致 options 与 labels 配对错位。
+
+> 注意：框架的保存接口 `validate_config` **只校验类型、不校验 options 成员**，
+> 因此历史值即便没被并入也不会保存失败；并入它纯粹是为了**界面可见性**。
 
 ### 4.3 重试
 
@@ -125,6 +214,7 @@
 | --- | --- |
 | `/llmguard status` | 开关、包装数、标记数、近 5 分钟成功率、测活调度状态 |
 | `/llmguard models` | 列出全部服务提供商 ID 与模型名（填配置用） |
+| `/llmguard profiles` | 列出 AstrBot 的配置文件（名称 / id / 当前默认模型） |
 | `/llmguard providers` | 每个模型的调用/成功/错误、最近错误分类、平均延迟 |
 | `/llmguard marks` | 当前标记（状态、原因、剩余 TTL、下次测活时间） |
 | `/llmguard route` | 当前会话所属配置文件的生效候选链与跳过项 |
@@ -143,6 +233,8 @@
 | --- | --- | --- |
 | GET | `/astrbot_plugin_llm_model_guard/overview` | 总览（开关、运行时、统计、模型列表、标记、路由） |
 | GET | `/astrbot_plugin_llm_model_guard/routes` | 路由视图 + 配置文件列表（query `profile_id` 可选） |
+| GET | `/astrbot_plugin_llm_model_guard/profiles` | 框架配置文件列表（id / name / path / 默认模型）+ 未能解析的引用 `unmatched` |
+| GET | `/astrbot_plugin_llm_model_guard/schema_refresh` | 重新注入配置文件下拉选项（幂等），返回注入报告 |
 | GET | `/astrbot_plugin_llm_model_guard/events` | 最近调用记录（query `limit` ≤500、`provider_id`、`profile_id`） |
 | GET | `/astrbot_plugin_llm_model_guard/health` | 包装数、supervisor 状态、内部错误计数 |
 | POST | `/astrbot_plugin_llm_model_guard/mark` | body `{provider_id, ttl?, reason?}` |
@@ -186,6 +278,26 @@
 - **不做主动通知**：模型被标记时只写日志 + 页面展示，不推送管理员消息（原任务包的
   `notify_admin_on_mark` 已书面豁免）；
 - 用户自定义错误规则的正则没有超时保护（只有管理员可配置，风险有限）；
+- **`select_providers` 属 AstrBot Core 内部实现**：官方文档
+  `docs/zh/dev/star/guides/plugin-config.md` 明确标注「随时可能变动，请勿在插件中使用」。
+  本插件用它表达「有序回退链」，因为框架的 `ProviderSelector` 多选模式本身就
+  按点击顺序维护数组并支持上下移，语义完全吻合。风险与规避：
+  - **数据面无风险**：`select_providers` 只影响 WebUI 控件，存盘的仍然是
+    `list[str]`；插件的候选链组装不依赖框架前端，控件退化成普通列表输入框时
+    配置与运行时行为都不变；
+  - **界面面有风险**：框架若改名或移除该 `_special`，配置页的「回退模型」会
+    退化成手工输入列表（不影响已有配置，用户仍可照常编辑）；
+  - **降级路径**：`fallback_pool`（顶层）提供了同样的多选入口，
+    `routes[].fallbacks` 仍可手工填写，两条路都能表达有序回退链；
+- **配置文件下拉的实时性**：下拉的选项来自**插件运行时**读到的框架配置文件列表，
+  并在插件初始化 / `/llmguard reload` / `GET .../schema_refresh` 时注入 schema。
+  含义是：**用户在框架里新建/删除 abconf 后**，插件配置页的选项不会立刻变化 ——
+  需要重新打开配置页（会重新请求 schema，但若未触发过刷新，拿到的仍是上次注入的
+  列表）**或**执行一次 `/llmguard reload` / `schema_refresh`。
+  框架侧没有「abconf 变更 → 通知插件」的钩子，这是当前的已知限制。
+- **同名配置文件仍需人工消歧**：框架的 `create_conf(name=...)` 不校验重名，
+  允许存在多个同名 abconf。下拉里会**都列出来**（靠 id 区分），但插件按名称解析时
+  会**拒绝接管**并告警 —— 需要用户改用 id 选取，或在框架里重命名。
 - `CALL_CONTEXT` 在同一个事件 task 内会复用（TTL 180 秒），第三方插件在同一事件里调用
   `context.llm_generate()` 时可能被强制走上本插件的候选链（已知待优化项）。
 
@@ -203,9 +315,10 @@ python devtools/check_plugin_structure.py astrbot_plugin_llm_model_guard
 python devtools/check_encoding.py astrbot_plugin_llm_model_guard
 ```
 
-模块划分：`core/models.py`（数据模型）、`core/classifier.py`（错误分类）、`core/routing.py`（路由）、`core/registry.py`（包装挂载）、`core/wrapper.py`（守护运行时）、`core/guardian.py`（标记 + 测活）、`core/store.py`（持久化）、`core/metrics.py`（统计）、`core/commands.py`（命令文本）、`core/web_api.py`（Web API 视图）。
+模块划分：`core/models.py`（数据模型）、`core/classifier.py`（错误分类）、`core/routing.py`（路由）、`core/registry.py`（包装挂载）、`core/wrapper.py`（守护运行时）、`core/guardian.py`（标记 + 测活）、`core/store.py`（持久化）、`core/metrics.py`（统计）、`core/commands.py`（命令文本）、`core/web_api.py`（Web API 视图）、`core/schema_sync.py`（配置文件下拉的动态注入）。
 
-依赖方向严格单向：`models ← classifier/routing/metrics/store ← guardian ← wrapper ← main`。
+依赖方向严格单向：`models ← classifier/routing/metrics/store ← guardian ← wrapper ← main`，
+`schema_sync` 只依赖标准库，被 `main` 调用。
 
 ---
 

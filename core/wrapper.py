@@ -49,7 +49,9 @@ from .routing import (
     WARN_ALL_CANDIDATES_MARKED,
     WARN_ROUTE_PROVIDER_MISSING,
     build_candidate_chain,
-    build_route_table,
+    build_merged_route_table,
+    collect_profile_entries,
+    resolve_disabled_profiles,
     resolve_profile_id,
     select_route,
 )
@@ -66,6 +68,11 @@ WRAP_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
 
 #: 候选链上下文的过期时间（秒）；框架降级二次进入的去重依赖它。
 CALL_CONTEXT_TTL_S = 180.0
+
+#: 框架配置文件列表的缓存时长（秒）。
+#: 框架的 ``get_conf_list()`` 每次都要查 SharedPreferences 数据库，是热路径上的
+#: 同步 IO；这里做短 TTL 缓存，代价是新建/删除配置文件最多延迟一个 TTL 才可见。
+PROFILE_ENTRIES_TTL_SECONDS = 30.0
 
 #: 位置参数调用无法安全重排，直接透传并计数。
 KIND_POSITIONAL = "positional_passthrough"
@@ -243,6 +250,11 @@ class Guard:
         self._route_table: dict[str, RouteConfig] = {}
         self._route_warnings: list[str] = []
         self._route_fingerprint = ""
+        self._profile_entries: list[dict[str, str]] = []
+        self._profile_entries_fingerprint = ""
+        self._profile_entries_fetched_at = -1e18
+        self._disabled_profile_ids: frozenset[str] = frozenset()
+        self._disabled_fingerprint = ""
         self._retry_budget: dict[str, Deque[float]] = {}
         self._classifier_installed: int = 0
         self._rules_signature: str = ""
@@ -278,12 +290,53 @@ class Guard:
         return self._stopping or not self.settings.enable
 
     @property
+    def profile_entries(self) -> list[dict[str, str]]:
+        """框架里的配置文件列表（id / name / path），带 TTL 缓存。
+
+        框架的 ``get_conf_list()`` 每次都会查一次 SharedPreferences 数据库，
+        属于热路径上的同步 IO，因此这里做 **TTL 缓存**：默认
+        :data:`PROFILE_ENTRIES_TTL_SECONDS` 秒内复用上一次结果。
+
+        缓存过期后重新拉取：框架新建/删除配置文件最多延迟一个 TTL 才会被看到
+        （新建后可用 ``/llmguard reload`` 立即刷新）。
+        """
+        now = self._monotonic()
+        if (
+            self._profile_entries
+            and (now - self._profile_entries_fetched_at) < PROFILE_ENTRIES_TTL_SECONDS
+        ):
+            return self._profile_entries
+        entries = collect_profile_entries(self.acm)
+        self._profile_entries = entries
+        self._profile_entries_fetched_at = now
+        self._profile_entries_fingerprint = "|".join(
+            sorted(f"{item['id']}::{item['name']}" for item in entries)
+        )
+        return self._profile_entries
+
+    def refresh_profile_entries(self) -> list[dict[str, str]]:
+        """强制重新拉取框架配置文件列表（忽略 TTL 缓存）。
+
+        用于「用户在框架里刚新建了 abconf，想立刻在插件配置页看到它」的场景。
+        """
+        self._profile_entries_fetched_at = -1e18
+        return self.profile_entries
+
+    @property
     def route_table(self) -> dict[str, RouteConfig]:
         settings = self.settings
-        fingerprint = settings.fingerprint()
+        entries = self.profile_entries
+        # 指纹同时包含配置与配置文件列表：框架里新增/重命名 abconf 后，
+        # 按名称配置的路由才能被重新解析。
+        fingerprint = f"{settings.fingerprint()}\x1e{self._profile_entries_fingerprint}"
         if fingerprint != self._route_fingerprint:
             warnings: list[str] = []
-            table = build_route_table(list(settings.routes), warnings=warnings)
+            table, _resolved = build_merged_route_table(
+                settings.routes,
+                settings.profiles,
+                entries=entries,
+                warnings=warnings,
+            )
             self._route_table = table
             self._route_warnings = warnings
             self._route_fingerprint = fingerprint
@@ -291,6 +344,25 @@ class Guard:
             for code in warnings:
                 self._warn(f"路由配置告警：{code}")
         return self._route_table
+
+    @property
+    def disabled_profile_ids(self) -> frozenset[str]:
+        """``disabled_profiles`` 解析后的真实 id 集合（支持填名称）。"""
+        settings = self.settings
+        entries = self.profile_entries
+        fingerprint = f"{settings.fingerprint()}\x1e{self._profile_entries_fingerprint}"
+        if fingerprint != self._disabled_fingerprint:
+            warnings: list[str] = []
+            resolved = resolve_disabled_profiles(
+                settings.disabled_profiles,
+                entries=entries,
+                warnings=warnings,
+            )
+            self._disabled_profile_ids = frozenset(resolved)
+            self._disabled_fingerprint = fingerprint
+            for code in warnings:
+                self._warn(f"不接管列表告警：{code}")
+        return self._disabled_profile_ids
 
     def _sync_classifier_rules(self) -> None:
         """把配置里的自定义规则同步到分类器；规则内容变化才重新编译。"""
@@ -391,7 +463,7 @@ class Guard:
             route = select_route(
                 profile_id=profile_id,
                 table=self.route_table,
-                disabled_profiles=settings.disabled_profiles,
+                disabled_profiles=self.disabled_profile_ids,
             )
         native_id = self.native_provider_id(umo)
         marks = self.guardian.marks_for(profile_id)
@@ -407,6 +479,7 @@ class Guard:
             requested_id=manual_id,
             native_id=native_id,
             framework_fallback_ids=self.framework_fallback_ids(umo),
+            fallback_pool=settings.fallback_pool,
             marks=marks,
             union_framework_fallbacks=settings.union_framework_fallbacks,
             respect_manual_selection=respect_manual,
@@ -648,7 +721,7 @@ class Guard:
         route = select_route(
             profile_id=profile_id,
             table=self.route_table,
-            disabled_profiles=settings.disabled_profiles,
+            disabled_profiles=self.disabled_profile_ids,
         )
         if route is None:
             return None
@@ -656,6 +729,7 @@ class Guard:
         plan = build_candidate_chain(
             route=route,
             framework_fallback_ids=self.framework_fallback_ids(str(session_id)),
+            fallback_pool=settings.fallback_pool,
             marks=marks,
             union_framework_fallbacks=settings.union_framework_fallbacks,
             respect_manual_selection=False,
@@ -1265,6 +1339,9 @@ class Guard:
         """让配置派生缓存失效（配置热重载、命令 ``/llmguard reload`` 用）。"""
         self._settings_fingerprint = ""
         self._route_fingerprint = ""
+        self._disabled_fingerprint = ""
+        # 配置文件列表也立刻重取，方便刚在 WebUI 新建的 abconf 马上可用。
+        self._profile_entries_fetched_at = -1e18
 
     @property
     def state_path(self) -> str:

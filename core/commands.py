@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from .models import Action, MarkState
 from .routing import profile_suggestions
@@ -106,7 +106,7 @@ def format_status(guard: Any, *, now: float | None = None) -> str:
         )
     else:
         lines.append("当前没有被标记的模型。")
-    lines.append("提示: /llmguard models 查看模型 ID；/llmguard route 查看生效链。")
+    lines.append("提示: /llmguard models 查看模型 ID；/llmguard profiles 查看配置文件；/llmguard route 查看生效链。")
     return "\n".join(lines)
 
 
@@ -175,12 +175,20 @@ def format_route(
         "unmanaged": "未纳管（插件不介入）",
     }.get(plan.source, plan.source)
 
-    lines = [f"【路由】配置文件: {resolved_profile or selection.profile_id or '未知'}｜来源: {source_text}"]
+    profile_text = resolved_profile or selection.profile_id or "未知"
+    names = profile_name_map(guard)
+    if resolved_profile and resolved_profile in names:
+        profile_text = f"{names[resolved_profile]} ({resolved_profile})"
+
+    lines = [f"【路由】配置文件: {profile_text}｜来源: {source_text}"]
     if selection.route is not None:
         lines.append(
             f"主模型: {selection.route.primary or '（空）'}"
             f"｜回退链: {'、'.join(selection.route.fallbacks) or '（无）'}"
         )
+    pool = getattr(guard.settings, "fallback_pool", ())
+    if pool:
+        lines.append(f"公共回退池: {'、'.join(pool)}")
     lines.append(f"本次候选链: {' → '.join(plan.candidates) or '（空，不接管）'}")
     if plan.bypassed:
         lines.append("因标记被跳过: " + "、".join(plan.bypassed))
@@ -190,6 +198,49 @@ def format_route(
         lines.append("配置里不存在、已剔除: " + "、".join(plan.missing) + hint)
     if plan.degraded_use:
         lines.append(f"注意: 全部候选都被标记，已强制使用 {plan.degraded_use}")
+    return "\n".join(lines)
+
+
+def profile_name_map(guard: Any) -> dict[str, str]:
+    """``{profile_id: 配置文件名}``；取不到名称时返回空映射。"""
+    entries = getattr(guard, "profile_entries", None) or []
+    result: dict[str, str] = {}
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        profile_id = str(entry.get("id") or "").strip()
+        if not profile_id:
+            continue
+        name = str(entry.get("name") or "").strip()
+        if name and name != profile_id:
+            result[profile_id] = name
+    return result
+
+
+def format_profiles(guard: Any) -> str:
+    """``/llmguard profiles``：列出框架里的配置文件与当前默认模型。
+
+    插件配置页无法用框架的 abconf 选择器（框架没提供），所以用这个命令把
+    「可填的名称」告诉用户，配合插件页面“配置文件”区一起用。
+    """
+    from .web_api import collect_profiles
+
+    try:
+        profiles = collect_profiles(guard)
+    except Exception:
+        profiles = []
+    if not profiles:
+        return "当前读不到任何配置文件信息；请确认 AstrBot 已加载完成。"
+    lines = ["【配置文件】名称 / id / 当前默认模型"]
+    for item in profiles:
+        marker = "（默认）" if item.get("is_default") else ""
+        default_provider = item.get("default_provider") or "未配置"
+        lines.append(
+            f"- {item.get('name') or item.get('id')}{marker}"
+            f"｜id={item.get('id')}"
+            f"｜默认模型={default_provider}"
+        )
+    lines.append("提示: 插件配置里“配置文件路由”的 profile 可直接填上面的名称。")
     return "\n".join(lines)
 
 

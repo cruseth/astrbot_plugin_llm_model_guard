@@ -179,6 +179,39 @@ class RouteConfig:
 
 
 @dataclass(frozen=True)
+class ProfileRouteConfig:
+    """``profiles`` 里的一条配置：按「配置文件引用」指定主模型与回退链。
+
+    与 :class:`RouteConfig` 的区别只有两点：
+
+    * ``profile_ref`` 允许填**名称**（框架没有 abconf 选择器，插件无法动态注入
+      选项），解析规则见 :mod:`core.routing`；
+    * 它是 ``routes`` 的补充来源，合并时 ``routes`` 优先。
+    """
+
+    profile_ref: str
+    primary: str = ""
+    fallbacks: tuple[str, ...] = ()
+    max_retries: int | None = None
+    probe_interval: int | None = None
+    probe_timeout: float | None = None
+    enable: bool = True
+    note: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "profile_ref": self.profile_ref,
+            "primary": self.primary,
+            "fallbacks": list(self.fallbacks),
+            "max_retries": self.max_retries,
+            "probe_interval": self.probe_interval,
+            "probe_timeout": self.probe_timeout,
+            "enable": self.enable,
+            "note": self.note,
+        }
+
+
+@dataclass(frozen=True)
 class ChainPlan:
     """一次调用的候选链计划。"""
 
@@ -426,6 +459,10 @@ class GuardSettings:
     routes: tuple[RouteConfig, ...] = ()
     error_rules: tuple[Mapping[str, Any], ...] = ()
     disabled_profiles: frozenset[str] = frozenset()
+    #: ``profiles``：按「配置文件名或 id」表达的路由补充来源。
+    profiles: tuple[ProfileRouteConfig, ...] = ()
+    #: ``fallback_pool``：公共回退池，所有路由共享的有序回退候选。
+    fallback_pool: tuple[str, ...] = ()
 
     # ---- 派生值 ----
 
@@ -531,6 +568,22 @@ class GuardSettings:
                     ]
                 )
             )
+        for profile in self.profiles:
+            parts.append(
+                "|".join(
+                    [
+                        profile.profile_ref,
+                        profile.primary,
+                        ",".join(profile.fallbacks),
+                        str(profile.max_retries),
+                        str(profile.probe_interval),
+                        str(profile.probe_timeout),
+                        str(int(profile.enable)),
+                        profile.note,
+                    ]
+                )
+            )
+        parts.append(",".join(self.fallback_pool))
         parts.append(",".join(sorted(self.disabled_profiles)))
         return "\x1f".join(parts)
 
@@ -555,6 +608,8 @@ class GuardSettings:
             "allow_webui_actions": self.allow_webui_actions,
             "log_level": self.log_level,
             "route_count": len(self.routes),
+            "profile_route_count": len(self.profiles),
+            "fallback_pool_count": len(self.fallback_pool),
             "error_rule_count": len(self.error_rules),
             "disabled_profiles": sorted(self.disabled_profiles),
         }
@@ -590,6 +645,19 @@ class GuardSettings:
             for item in raw_rules:
                 if isinstance(item, Mapping):
                     rules.append(dict(item))
+
+        profiles: list[ProfileRouteConfig] = []
+        raw_profiles = get("profiles", []) or []
+        if isinstance(raw_profiles, Mapping):
+            raw_profiles = list(raw_profiles.values())
+        if isinstance(raw_profiles, Iterable) and not isinstance(raw_profiles, (str, bytes)):
+            for item in raw_profiles:
+                if isinstance(item, Mapping):
+                    profile = profile_route_from_mapping(item)
+                    if profile is not None:
+                        profiles.append(profile)
+
+        fallback_pool = _as_str_list(get("fallback_pool", []))
 
         return cls(
             enable=_as_bool(get("enable", True), True),
@@ -642,6 +710,8 @@ class GuardSettings:
             routes=tuple(routes),
             error_rules=tuple(rules),
             disabled_profiles=frozenset(_as_str_list(get("disabled_profiles", []))),
+            profiles=tuple(profiles),
+            fallback_pool=fallback_pool,
         )
 
 
@@ -672,6 +742,44 @@ def route_from_mapping(item: Mapping[str, Any]) -> RouteConfig | None:
 
     return RouteConfig(
         profile_id=profile_id,
+        primary=primary,
+        fallbacks=fallbacks,
+        max_retries=_optional_int("max_retries"),
+        probe_interval=_optional_int("probe_interval_seconds"),
+        probe_timeout=_optional_float("probe_timeout_seconds"),
+        enable=_as_bool(item.get("enable", True), True),
+        note=_as_str(item.get("note")),
+    )
+
+
+def profile_route_from_mapping(item: Mapping[str, Any]) -> ProfileRouteConfig | None:
+    """把 ``profiles`` 里的一条配置转成 :class:`ProfileRouteConfig`。
+
+    ``profile_ref`` 允许填**名称**或**id**（框架没有 abconf 选择器，插件无法在
+    schema 里动态注入选项）；空值视为兜底路由（等价于 ``routes`` 里的 ``*``）。
+    """
+    if not isinstance(item, Mapping):
+        return None
+
+    raw_ref = _as_str(item.get("profile_ref")) or _as_str(item.get("profile"))
+    profile_ref = raw_ref if raw_ref else WILDCARD_PROFILE
+    primary = _as_str(item.get("primary"))
+    fallbacks = tuple(
+        fid for fid in _as_str_list(item.get("fallbacks", ())) if fid and fid != primary
+    )
+
+    def _optional_int(key: str) -> int | None:
+        value = item.get(key, -1)
+        number = _as_int(value, -1)
+        return None if number < 0 else number
+
+    def _optional_float(key: str) -> float | None:
+        value = item.get(key, -1)
+        number = _as_float(value, -1.0)
+        return None if number < 0 else number
+
+    return ProfileRouteConfig(
+        profile_ref=profile_ref,
         primary=primary,
         fallbacks=fallbacks,
         max_retries=_optional_int("max_retries"),

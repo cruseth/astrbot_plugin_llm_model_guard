@@ -24,6 +24,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 from .core import commands as command_text
+from .core import schema_sync
 from .core import web_api
 from .core.guardian import Guardian
 from .core.metrics import Metrics
@@ -91,6 +92,7 @@ class LLMModelGuardPlugin(Star):
 
         self._load_state()
         self._register_web_api()
+        self._sync_schema_options()
         logger.info(
             f"{LOG_PREFIX} 插件已加载：状态文件={self.store.path}，"
             f"路由={len(settings.routes)} 条，Web API 失败={len(self._web_api_errors)}"
@@ -279,6 +281,15 @@ class LLMModelGuardPlugin(Star):
             return
         yield event.plain_result(command_text.format_providers(self.guard))
 
+    @llmguard.command("profiles")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def cmd_profiles(self, event: AstrMessageEvent):
+        """列出 AstrBot 的配置文件（名称 / id / 默认模型），便于填写插件配置。"""
+        if not self._is_admin(event):
+            yield event.plain_result("仅管理员可使用该命令。")
+            return
+        yield event.plain_result(command_text.format_profiles(self.guard))
+
     @llmguard.command("marks")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def cmd_marks(self, event: AstrMessageEvent):
@@ -377,6 +388,38 @@ class LLMModelGuardPlugin(Star):
     # 接入点 6b：Web API
     # ------------------------------------------------------------------
 
+    def _sync_schema_options(self) -> dict[str, Any]:
+        """把框架的配置文件列表注入 ``self.config.schema`` 的 options/labels。
+
+        框架没有 abconf 选择器，但插件配置页的 schema 直接引用
+        ``config.schema`` 对象（dashboard 的 ``/api/config/get``），因此**原地**
+        改写就能让配置页渲染出真正动态的下拉。
+
+        失败时保持原 schema 不变，不影响插件运行。
+        """
+        try:
+            entries = self.guard.profile_entries
+            report = schema_sync.inject_profile_options(
+                self.config,
+                entries,
+                historical_refs=schema_sync.collect_historical_refs(self.config),
+            )
+        except Exception as exc:  # pragma: no cover - 注入失败绝不影响插件
+            logger.warning(f"{LOG_PREFIX} 注入配置文件选项失败：{exc}")
+            return {"ok": False, "reason": f"exception: {exc}", "injected": []}
+        if report.get("ok"):
+            logger.info(
+                f"{LOG_PREFIX} 已注入配置文件选项："
+                f"{len(report.get('injected', []))} 个字段，"
+                f"共 {report.get('options_count', 0)} 个选项"
+            )
+        else:
+            logger.warning(
+                f"{LOG_PREFIX} 配置文件选项未注入（{report.get('reason')}），"
+                "配置页将退化为手填"
+            )
+        return report
+
     def _register_web_api(self) -> None:
         register_api = getattr(self.context, "register_web_api", None)
         if not callable(register_api):
@@ -396,6 +439,18 @@ class LLMModelGuardPlugin(Star):
             (web_api.ROUTE_ROUTES, self._api_routes, ["GET"], "LLM 模型守护：路由与配置文件"),
             (web_api.ROUTE_EVENTS, self._api_events, ["GET"], "LLM 模型守护：最近调用记录"),
             (web_api.ROUTE_HEALTH, self._api_health, ["GET"], "LLM 模型守护：运行健康"),
+            (
+                web_api.ROUTE_PROFILES,
+                self._api_profiles,
+                ["GET"],
+                "LLM 模型守护：框架配置文件列表",
+            ),
+            (
+                web_api.ROUTE_SCHEMA_REFRESH,
+                self._api_schema_refresh,
+                ["GET"],
+                "LLM 模型守护：刷新配置文件下拉选项",
+            ),
             (web_api.ROUTE_MARK, self._api_mark, ["POST"], "LLM 模型守护：手动标记"),
             (web_api.ROUTE_UNMARK, self._api_unmark, ["POST"], "LLM 模型守护：解除标记"),
             (web_api.ROUTE_PROBE, self._api_probe, ["POST"], "LLM 模型守护：立刻测活"),
@@ -428,6 +483,29 @@ class LLMModelGuardPlugin(Star):
 
     async def _api_health(self, **_: Any) -> Any:
         return self._respond(self._safe_build(web_api.build_health))
+
+    async def _api_schema_refresh(self, **_: Any) -> Any:
+        """重新注入 schema 的配置文件下拉选项（幂等）。
+
+        框架里新建/删除配置文件后调用本端点，可以让插件配置页的下拉立刻反映
+        最新列表，而不必等 TTL 过期或重启插件。
+        """
+        try:
+            # 忽略 TTL 缓存，强制重新拉取框架的配置文件列表。
+            entries = self.guard.refresh_profile_entries()
+            report = schema_sync.inject_profile_options(
+                self.config,
+                entries,
+                historical_refs=schema_sync.collect_historical_refs(self.config),
+            )
+            report["profiles"] = entries
+            return self._respond(web_api.envelope_ok(report))
+        except Exception as exc:  # pragma: no cover - 刷新失败也要返回信封
+            logger.warning(f"{LOG_PREFIX} 刷新配置文件选项失败：{exc}")
+            return self._respond(web_api.envelope_error(f"刷新失败：{exc}"))
+
+    async def _api_profiles(self, **_: Any) -> Any:
+        return self._respond(self._safe_build(web_api.build_profiles))
 
     async def _api_mark(self, **_: Any) -> Any:
         return await self._api_action("mark")
@@ -524,6 +602,9 @@ class LLMModelGuardPlugin(Star):
         self.guard.invalidate_caches()
         self.metrics.window_s = settings.stats_window_seconds
         self.metrics.recent_cap = max(1, settings.stats_recent_events)
+        # 重新注入配置文件下拉选项（框架里可能刚新建/删除了 abconf）。
+        self.guard.refresh_profile_entries()
+        schema_report = self._sync_schema_options()
         routes = len(self.guard.route_table)
         wrapped = self.guard.ensure_wrapped_all() if settings.enable else 0
         if settings.enable:
@@ -535,7 +616,9 @@ class LLMModelGuardPlugin(Star):
         return (
             f"已重载：路由 {routes} 条，自定义规则 "
             f"{getattr(self.guard.classifier, 'rule_count', 0)} 条，"
-            f"本次新包装 {wrapped} 个 provider。总开关={'开启' if settings.enable else '关闭'}"
+            f"本次新包装 {wrapped} 个 provider。"
+            f"配置文件选项{'已刷新' if schema_report.get('ok') else '未刷新（配置页需手填）'}。"
+            f"总开关={'开启' if settings.enable else '关闭'}"
         )
 
 

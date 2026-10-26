@@ -28,6 +28,9 @@ const pageState = {
   events: undefined,
   eventsUnsupported: false,
   eventProviderFilter: "",
+  profiles: undefined,
+  profilesUnsupported: false,
+  profilesError: "",
   autoRefresh: true,
   intervalMs: DEFAULT_INTERVAL_MS,
   timerId: null,
@@ -242,6 +245,7 @@ function unwrapEnvelope(payload) {
     const looksLikeData =
       inner.providers !== undefined ||
       inner.routes !== undefined ||
+      inner.profiles !== undefined ||
       inner.marks !== undefined ||
       inner.events !== undefined ||
       inner.stats !== undefined ||
@@ -464,9 +468,15 @@ function normalizeRoutes(rawRoutes) {
     const profileId = String(
       pick(entry, ["profile_id", "id", "profile", "conf_id"]) || fallbackId || "",
     );
+    const profileName = String(pick(entry, ["profile_name", "name", "conf_name"]) || "");
+    // profile_display 由后端给出「名称 (id)」；取不到时本地等价拼一次，再退回 id。
+    const profileDisplay =
+      String(pick(entry, ["profile_display", "display"]) || "") ||
+      (profileName && profileId ? `${profileName} (${profileId})` : profileName || profileId);
     list.push({
       profileId,
-      profileName: String(pick(entry, ["profile_name", "name", "conf_name"]) || ""),
+      profileName,
+      profileDisplay,
       primary: String(pick(entry, ["primary", "primary_model", "main", "main_model"]) || ""),
       fallbacks,
       chain,
@@ -609,6 +619,56 @@ function normalizeEvents(raw) {
   return list.filter((item) => item && typeof item === "object");
 }
 
+/**
+ * GET /profiles 的 data：{profiles:[{id,name,path,is_default,default_provider,
+ * default_provider_exists}], unmatched:[]}。
+ * 同时兼容 profile_id / default_provider_id 等别名写法。
+ */
+function normalizeProfiles(raw) {
+  const source = unwrapEnvelope(raw);
+  let list = [];
+  if (Array.isArray(source)) {
+    list = source;
+  } else if (source && typeof source === "object") {
+    if (Array.isArray(source.profiles)) list = source.profiles;
+    else if (Array.isArray(source.items)) list = source.items;
+    else if (Array.isArray(source.conf_list)) list = source.conf_list;
+  }
+
+  const profiles = list
+    .filter((item) => item && typeof item === "object")
+    .map((item) => {
+      const id = String(pick(item, ["id", "profile_id", "conf_id"]) || "");
+      return {
+        id,
+        name: String(pick(item, ["name", "profile_name", "conf_name", "display_name"]) || ""),
+        path: String(pick(item, ["path", "file", "file_name", "config_path"]) || ""),
+        isDefault: asBool(pick(item, ["is_default", "default"])) === true,
+        defaultProvider: String(
+          pick(item, ["default_provider", "default_provider_id", "provider", "provider_id"]) || "",
+        ),
+        defaultProviderExists: asBool(
+          pick(item, ["default_provider_exists", "provider_exists"]),
+        ),
+      };
+    })
+    .filter((item) => item.id || item.name);
+
+  const rawUnmatched =
+    source && typeof source === "object" && Array.isArray(source.unmatched)
+      ? source.unmatched
+      : [];
+  const unmatched = rawUnmatched
+    .map((item) =>
+      typeof item === "string"
+        ? item
+        : String(pick(item || {}, ["profile_id", "id", "profile", "profile_display"]) || ""),
+    )
+    .filter(Boolean);
+
+  return { profiles, unmatched };
+}
+
 /* ---------- 渲染：顶栏与卡片 ---------- */
 
 function renderSummary(data) {
@@ -711,6 +771,143 @@ function renderCards(data) {
   }
 }
 
+/* ---------- 渲染：配置文件 ---------- */
+
+function profileStatusBadge(profile) {
+  if (!profile.defaultProvider) {
+    return el("span", "lm-badge lm-badge--mute", "未设置默认模型");
+  }
+  if (profile.defaultProviderExists === false) {
+    return el("span", "lm-badge lm-badge--warn", "默认模型缺失");
+  }
+  return el("span", "lm-badge lm-badge--ok", "正常");
+}
+
+function renderProfiles() {
+  const wrap = ui.profilesWrap;
+  if (!wrap) return;
+  clearNode(wrap);
+
+  const state = pageState.profiles;
+
+  if (pageState.profilesUnsupported) {
+    if (ui.profilesCount) ui.profilesCount.textContent = "—";
+    if (ui.profilesHint) ui.profilesHint.textContent = "";
+    const empty = el("div", "lm-empty");
+    empty.appendChild(el("strong", null, "当前后端未提供配置文件列表"));
+    empty.appendChild(
+      el(
+        "span",
+        null,
+        "后端尚未注册 /profiles 接口；路由表会回退显示配置文件 id。升级插件后刷新本页即可看到配置文件名称。",
+      ),
+    );
+    wrap.appendChild(empty);
+    return;
+  }
+
+  if (state === undefined) {
+    if (ui.profilesCount) ui.profilesCount.textContent = "—";
+    if (ui.profilesHint) ui.profilesHint.textContent = "";
+    wrap.appendChild(el("div", "lm-empty", "正在加载配置文件列表…"));
+    return;
+  }
+
+  if (state === null) {
+    if (ui.profilesCount) ui.profilesCount.textContent = "—";
+    if (ui.profilesHint) ui.profilesHint.textContent = "";
+    const box = el("div", "lm-inline-notice lm-inline-notice--error");
+    box.appendChild(el("strong", null, "配置文件列表加载失败："));
+    box.appendChild(el("span", null, pageState.profilesError || "未知错误"));
+    wrap.appendChild(box);
+    const retryRow = el("div", "lm-retry-row");
+    const retry = el("button", "lm-btn lm-btn--sm", "重试");
+    retry.type = "button";
+    retry.addEventListener("click", () => {
+      loadProfiles();
+    });
+    retryRow.appendChild(retry);
+    wrap.appendChild(retryRow);
+    return;
+  }
+
+  const profiles = state.profiles;
+  if (ui.profilesCount) ui.profilesCount.textContent = String(profiles.length);
+  if (ui.profilesHint) {
+    ui.profilesHint.textContent = profiles.length ? "来自 AstrBot 框架的配置文件" : "";
+  }
+
+  if (state.unmatched.length) {
+    const notice = el("div", "lm-inline-notice lm-inline-notice--warn");
+    notice.appendChild(el("strong", null, "有路由指向框架里不存在的配置文件："));
+    notice.appendChild(el("span", "lm-mono", state.unmatched.join("、")));
+    wrap.appendChild(notice);
+  }
+
+  if (!profiles.length) {
+    const empty = el("div", "lm-empty");
+    empty.appendChild(el("strong", null, "没有读取到配置文件"));
+    empty.appendChild(
+      el("span", null, "框架未返回任何配置文件信息；若这是新装环境，先在 AstrBot 里创建/保存一次配置文件。"),
+    );
+    wrap.appendChild(empty);
+    return;
+  }
+
+  const scroll = el("div", "lm-table-scroll");
+  const table = el("table", "lm-table");
+  const thead = el("thead");
+  const headRow = el("tr");
+  for (const title of ["配置文件名", "id", "框架默认模型", "状态"]) {
+    headRow.appendChild(el("th", null, title));
+  }
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const tbody = el("tbody");
+  for (const profile of profiles) {
+    const row = el("tr");
+
+    const nameCell = el("td");
+    const nameLine = el("div");
+    nameLine.appendChild(
+      el("span", null, profile.name || profile.id || "（未命名配置文件）"),
+    );
+    if (profile.isDefault) {
+      nameLine.appendChild(el("span", "lm-badge lm-badge--ok lm-badge--inline", "默认"));
+    }
+    nameCell.appendChild(nameLine);
+    if (profile.path) {
+      nameCell.appendChild(el("span", "lm-cell-note lm-mono", profile.path));
+    }
+    row.appendChild(nameCell);
+
+    row.appendChild(el("td", "lm-mono", profile.id || "—"));
+
+    const providerCell = el("td");
+    if (profile.defaultProvider) {
+      providerCell.appendChild(el("span", "lm-mono", profile.defaultProvider));
+      if (profile.defaultProviderExists === false) {
+        providerCell.appendChild(
+          el("span", "lm-cell-note", "（模型已不存在，请到该配置文件里重新选择默认模型）"),
+        );
+      }
+    } else {
+      providerCell.appendChild(el("span", "lm-hint", "未配置"));
+    }
+    row.appendChild(providerCell);
+
+    const statusCell = el("td");
+    statusCell.appendChild(profileStatusBadge(profile));
+    row.appendChild(statusCell);
+
+    tbody.appendChild(row);
+  }
+  table.appendChild(tbody);
+  scroll.appendChild(table);
+  wrap.appendChild(scroll);
+}
+
 /* ---------- 渲染：路由 ---------- */
 
 function renderRoutes(data) {
@@ -761,10 +958,10 @@ function renderRoutes(data) {
     const row = el("tr");
 
     const profileCell = el("td");
-    profileCell.appendChild(
-      el("div", null, route.profileName || route.profileId || "—"),
-    );
-    if (route.profileName && route.profileId) {
+    const profileDisplay = route.profileDisplay || route.profileId || "";
+    profileCell.appendChild(el("div", null, profileDisplay || "—"));
+    // 有友好名称时，把裸 id 作为小字备注保留，方便与后端日志/配置核对。
+    if (route.profileId && profileDisplay !== route.profileId) {
       profileCell.appendChild(el("span", "lm-cell-note lm-mono", route.profileId));
     }
     row.appendChild(profileCell);
@@ -1186,6 +1383,7 @@ function renderAll() {
   const data = pageState.overview;
   renderSummary(data);
   renderCards(data);
+  renderProfiles();
   renderRoutes(data);
   renderProviders(data);
   renderMarks(data);
@@ -1300,7 +1498,32 @@ async function refreshAll() {
     pageState.loading = false;
     setBusy(ui.refreshButton, false);
     renderSummary(pageState.overview);
+    // 配置文件区独立加载：即使 overview 失败，它也能给出版本/错误提示。
+    loadProfiles();
   }
+}
+
+/** GET /profiles：独立容错，失败不影响其它面板。 */
+async function loadProfiles() {
+  // 已确认后端没有该端点时不再每轮轮询，避免每次刷新都打一次 404。
+  if (pageState.profilesUnsupported) return;
+  try {
+    const raw = await apiGet("profiles");
+    pageState.profiles = normalizeProfiles(raw);
+    pageState.profilesUnsupported = false;
+    pageState.profilesError = "";
+  } catch (error) {
+    if (isRouteMissing(error)) {
+      // 后端尚未注册 /profiles：显示「未提供」，不当作错误。
+      pageState.profilesUnsupported = true;
+      pageState.profiles = null;
+      pageState.profilesError = "";
+    } else {
+      pageState.profiles = null;
+      pageState.profilesError = errorText(error);
+    }
+  }
+  renderProfiles();
 }
 
 async function loadEvents() {
@@ -1536,6 +1759,9 @@ function cacheDom() {
   ui.reloadButton = $("lmReloadBtn");
   ui.autoToggle = $("lmAutoToggle");
   ui.intervalSelect = $("lmIntervalSelect");
+  ui.profilesWrap = $("lmProfilesWrap");
+  ui.profilesCount = $("lmProfilesCount");
+  ui.profilesHint = $("lmProfilesHint");
   ui.routesWrap = $("lmRoutesWrap");
   ui.routesCount = $("lmRoutesCount");
   ui.routesHint = $("lmRoutesHint");
@@ -1648,7 +1874,7 @@ function showBridgeMissing() {
   if (ui.refreshButton) ui.refreshButton.disabled = true;
   if (ui.autoToggle) ui.autoToggle.disabled = true;
   const message = "无法连接 AstrBot（缺少页面桥接），请在 WebUI 中打开本页面。";
-  for (const wrap of [ui.routesWrap, ui.providersWrap, ui.marksWrap]) {
+  for (const wrap of [ui.profilesWrap, ui.routesWrap, ui.providersWrap, ui.marksWrap]) {
     if (!wrap) continue;
     clearNode(wrap);
     wrap.appendChild(el("div", "lm-empty", message));

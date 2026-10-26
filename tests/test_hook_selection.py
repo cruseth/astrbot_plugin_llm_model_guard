@@ -279,6 +279,8 @@ def test_plugin_module_wiring(tmp_path: Path) -> None:
             web_api.ROUTE_ROUTES,
             web_api.ROUTE_EVENTS,
             web_api.ROUTE_HEALTH,
+            web_api.ROUTE_PROFILES,
+            web_api.ROUTE_SCHEMA_REFRESH,
             web_api.ROUTE_MARK,
             web_api.ROUTE_UNMARK,
             web_api.ROUTE_PROBE,
@@ -289,9 +291,19 @@ def test_plugin_module_wiring(tmp_path: Path) -> None:
         }
         assert methods_by_route[web_api.ROUTE_RELOAD] == ["POST"]
         assert methods_by_route[web_api.ROUTE_OVERVIEW] == ["GET"]
+        assert methods_by_route[web_api.ROUTE_PROFILES] == ["GET"]
+        assert methods_by_route[web_api.ROUTE_SCHEMA_REFRESH] == ["GET"]
         group = handle["filter"].groups["llmguard"]
         command_names = {name for name, _func in group.commands}
-        assert {"status", "models", "test", "mark", "unmark", "reload"} <= command_names
+        assert {
+            "status",
+            "models",
+            "profiles",
+            "test",
+            "mark",
+            "unmark",
+            "reload",
+        } <= command_names
 
         async def _lifecycle() -> None:
             await plugin.initialize()

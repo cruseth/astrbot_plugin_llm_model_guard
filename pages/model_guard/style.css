@@ -365,6 +365,47 @@ html[data-theme="dark"] .lm-btn--primary {
   font-size: 12px;
 }
 
+/* 面板内的行内提示（例如路由指向了框架里不存在的配置文件） */
+.lm-inline-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 10px;
+  padding: 8px 12px;
+  border: 1px solid transparent;
+  border-left-width: 4px;
+  border-radius: var(--lm-radius-sm);
+  font-size: 12px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.lm-inline-notice strong {
+  flex: 0 0 auto;
+  font-weight: 700;
+}
+
+.lm-inline-notice--warn {
+  color: var(--lm-warn);
+  background: var(--lm-warn-soft);
+  border-left-color: var(--lm-warn);
+}
+
+.lm-inline-notice--error {
+  color: var(--lm-danger);
+  background: var(--lm-danger-soft);
+  border-left-color: var(--lm-danger);
+}
+
+.lm-inline-notice .lm-mono {
+  font-size: 11px;
+}
+
+.lm-retry-row {
+  margin-top: 8px;
+  text-align: center;
+}
+
 /* ---------- 表格 ---------- */
 
 .lm-table-scroll {
@@ -480,6 +521,10 @@ html[data-theme="dark"] .lm-btn--primary {
 
 .lm-badge + .lm-badge {
   margin-left: 4px;
+}
+
+.lm-badge--inline {
+  margin-left: 6px;
 }
 
 /* ---------- 标记详情 ---------- */
